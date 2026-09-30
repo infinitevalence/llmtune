@@ -7,7 +7,9 @@
 #
 # Installs one binary (`llmtune`) plus its bundled architecture profiles.
 #
-# Needs: a Rust toolchain (cargo) to build, doas/sudo to install.
+# Needs: a Rust toolchain (cargo) to build, doas or sudo to install.
+# Alpine: apk add doas (not installed by default).
+# Debian/Ubuntu: sudo (usually pre-installed).
 set -eu
 # pipefail is bash-only; Alpine sh (dash) doesn't support it
 cd "$(dirname "$0")"
@@ -31,12 +33,24 @@ command -v cargo >/dev/null 2>&1 || {
   exit 1
 }
 
+# Detect doas or sudo (Alpine ships doas as a package, not pre-installed)
+if command -v doas >/dev/null 2>&1; then
+  PRIVESC=doas
+elif command -v sudo >/dev/null 2>&1; then
+  PRIVESC=sudo
+else
+  echo "error: doas or sudo required but not found" >&2
+  echo "  Alpine: apk add doas" >&2
+  echo "  Debian/Ubuntu: install sudo" >&2
+  exit 1
+fi
+
 echo ">> building release binary..."
 cargo build --release
 
-echo ">> installing $BIN (doas)..."
-doas install -Dm755 target/release/llmtune "$BIN"
-doas install -Dm644 profiles.toml "$DESTDIR$PREFIX/share/llmtune/profiles.toml"
+echo ">> installing $BIN ($PRIVESC)..."
+$PRIVESC install -Dm755 target/release/llmtune "$BIN"
+$PRIVESC install -Dm644 profiles.toml "$DESTDIR$PREFIX/share/llmtune/profiles.toml"
 
 echo ">> installed: $("$BIN" --version)"
 
@@ -46,11 +60,11 @@ if [ "$DO_CHECK" = 1 ]; then
 fi
 if [ "$DO_SETUP" = 1 ]; then
   echo ">> first-run setup:"
-  doas "$BIN" setup --yes
+  $PRIVESC "$BIN" setup --yes
 fi
 
 echo
 echo "Done. Launch the TUI:      llmtune"
 echo "  preflight the box:       llmtune doctor"
-echo "  first-run setup:         doas llmtune setup"
+echo "  first-run setup:  $PRIVESC llmtune setup"
 echo "  add and serve a model:   llmtune models add <url> && llmtune node load <name>"
