@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 # Build and install llmtune -- the BC-250 inference engine and fleet control plane.
 #
 #   ./install.sh            build (release) + install to /usr/local/bin
@@ -7,8 +7,9 @@
 #
 # Installs one binary (`llmtune`) plus its bundled architecture profiles.
 #
-# Needs: a Rust toolchain (cargo) to build, sudo to install.
-set -euo pipefail
+# Needs: a Rust toolchain (cargo) to build, doas/sudo to install.
+set -eu
+# pipefail is bash-only; Alpine sh (dash) doesn't support it
 cd "$(dirname "$0")"
 
 PREFIX="${PREFIX:-/usr/local}"
@@ -33,9 +34,9 @@ command -v cargo >/dev/null 2>&1 || {
 echo ">> building release binary..."
 cargo build --release
 
-echo ">> installing $BIN (sudo)..."
-sudo install -Dm755 target/release/llmtune "$BIN"
-sudo install -Dm644 profiles.toml "$DESTDIR$PREFIX/share/llmtune/profiles.toml"
+echo ">> installing $BIN (doas)..."
+doas install -Dm755 target/release/llmtune "$BIN"
+doas install -Dm644 profiles.toml "$DESTDIR$PREFIX/share/llmtune/profiles.toml"
 
 echo ">> installed: $("$BIN" --version)"
 
@@ -45,11 +46,11 @@ if [ "$DO_CHECK" = 1 ]; then
 fi
 if [ "$DO_SETUP" = 1 ]; then
   echo ">> first-run setup:"
-  sudo "$BIN" setup --yes
+  doas "$BIN" setup --yes
 fi
 
 echo
 echo "Done. Launch the TUI:      llmtune"
 echo "  preflight the box:       llmtune doctor"
-echo "  first-run setup:         sudo llmtune setup"
+echo "  first-run setup:         doas llmtune setup"
 echo "  add and serve a model:   llmtune models add <url> && llmtune node load <name>"
