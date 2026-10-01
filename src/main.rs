@@ -41,13 +41,13 @@ mod transport;
 mod ui;
 
 fn main() {
-    // Die quietly on a closed pipe (`llmtune --json ... | head`) instead of
-    // Rust's default "failed printing to stdout" panic - agents pipe us.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-    // cli::run renders failures itself (JSON object on stderr under --json,
-    // the classic `error:` line otherwise) and returns the exit code under
-    // the agentic convention: 0 ok, 1 error, 2 guard refusal (src/agentic.rs).
-    std::process::exit(cli::run());
+	// Die quietly on a closed pipe (`llmtune --json ... | head`) instead of
+	// Rust's default "failed printing to stdout" panic - agents pipe us.
+	unsafe {
+		libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+	}
+	// cli::run renders failures itself (JSON object on stderr under --json,
+	// the classic `error:` line otherwise) and returns the exit code under
+	// the agentic convention: 0 ok, 1 error, 2 guard refusal (src/agentic.rs).
+	std::process::exit(cli::run());
 }

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 fn euid() -> u32 {
-    unsafe { libc::geteuid() }
+	unsafe { libc::geteuid() }
 }
 
 /// Default ceiling for the best-effort blocking RMW/append locks (history append,
@@ -37,44 +37,44 @@ pub const RMW_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// this fd before `execve` fires `O_CLOEXEC`, which a single `LOCK_NB` would
 /// mis-read as contention (see [`LockGuard::acquire`]).
 pub fn flock_ex_timeout(fd: RawFd, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+	let deadline = Instant::now() + timeout;
+	loop {
+		if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+			return true;
+		}
+		if Instant::now() >= deadline {
+			return false;
+		}
+		std::thread::sleep(Duration::from_millis(2));
+	}
 }
 
 /// Directory for lock files - always writable by the current user.
 fn lock_dir() -> PathBuf {
-    // Honor the test/state override so isolated runs isolate their locks too.
-    if let Ok(d) = std::env::var("LLMTUNE_STATE_DIR") {
-        if !d.is_empty() {
-            return PathBuf::from(d).join("locks");
-        }
-    }
-    if euid() == 0 {
-        return PathBuf::from("/run/llmtune");
-    }
-    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
-        if !rt.is_empty() {
-            return PathBuf::from(rt).join("llmtune");
-        }
-    }
-    std::env::temp_dir().join(format!("llmtune-{}", euid()))
+	// Honor the test/state override so isolated runs isolate their locks too.
+	if let Ok(d) = std::env::var("LLMTUNE_STATE_DIR") {
+		if !d.is_empty() {
+			return PathBuf::from(d).join("locks");
+		}
+	}
+	if euid() == 0 {
+		return PathBuf::from("/run/llmtune");
+	}
+	if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+		if !rt.is_empty() {
+			return PathBuf::from(rt).join("llmtune");
+		}
+	}
+	std::env::temp_dir().join(format!("llmtune-{}", euid()))
 }
 
 /// The GPU-serialization lock (shared by swap + bench).
 fn gpu_lock() -> PathBuf {
-    lock_dir().join("gpu.lock")
+	lock_dir().join("gpu.lock")
 }
 
 fn build_lock() -> PathBuf {
-    lock_dir().join("build.lock")
+	lock_dir().join("build.lock")
 }
 
 /// Returned when another process already holds the lock.
@@ -86,93 +86,93 @@ pub struct Busy;
 /// file is left in place: deleting a flock'd path is racy (a fresh create+lock
 /// wouldn't conflict with a waiter holding the old inode), so we never unlink it.
 pub struct LockGuard {
-    _file: Option<File>,
+	_file: Option<File>,
 }
 
 impl LockGuard {
-    fn acquire(path: PathBuf) -> Result<LockGuard, Busy> {
-        // If we can't even create the lock dir/file, locking is unavailable -
-        // proceed best-effort (unlocked) rather than falsely reporting Busy.
-        if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                return Ok(LockGuard { _file: None });
-            }
-        }
-        let file = match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(_) => return Ok(LockGuard { _file: None }),
-        };
-        // Exclusive lock, non-blocking with a short bounded retry. A genuine
-        // holder keeps the lock for its whole operation (seconds), so after the
-        // retry window we still correctly report Busy for real contention. The
-        // retry exists because EWOULDBLOCK can be *transient with no real
-        // contention*: when another thread in this process spawns a subprocess
-        // (fork+exec of ssh/systemctl/git/cmake), the child momentarily inherits
-        // this fd during the window before execve fires O_CLOEXEC, so the flock
-        // counts as held until the child execs. Without the retry, a swap/bench/
-        // build could then spuriously fail as "busy" (and the test suite flakes,
-        // since its parallel ssh-probing tests fork constantly). Riding out that
-        // sub-millisecond window converts the false Busy into a real acquire.
-        let deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
-                return Ok(LockGuard { _file: Some(file) });
-            }
-            if Instant::now() >= deadline {
-                return Err(Busy);
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
+	fn acquire(path: PathBuf) -> Result<LockGuard, Busy> {
+		// If we can't even create the lock dir/file, locking is unavailable -
+		// proceed best-effort (unlocked) rather than falsely reporting Busy.
+		if let Some(parent) = path.parent() {
+			if std::fs::create_dir_all(parent).is_err() {
+				return Ok(LockGuard { _file: None });
+			}
+		}
+		let file = match OpenOptions::new()
+			.create(true)
+			.write(true)
+			.truncate(false)
+			.open(&path)
+		{
+			Ok(f) => f,
+			Err(_) => return Ok(LockGuard { _file: None }),
+		};
+		// Exclusive lock, non-blocking with a short bounded retry. A genuine
+		// holder keeps the lock for its whole operation (seconds), so after the
+		// retry window we still correctly report Busy for real contention. The
+		// retry exists because EWOULDBLOCK can be *transient with no real
+		// contention*: when another thread in this process spawns a subprocess
+		// (fork+exec of ssh/systemctl/git/cmake), the child momentarily inherits
+		// this fd during the window before execve fires O_CLOEXEC, so the flock
+		// counts as held until the child execs. Without the retry, a swap/bench/
+		// build could then spuriously fail as "busy" (and the test suite flakes,
+		// since its parallel ssh-probing tests fork constantly). Riding out that
+		// sub-millisecond window converts the false Busy into a real acquire.
+		let deadline = Instant::now() + Duration::from_millis(500);
+		loop {
+			let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+			if rc == 0 {
+				return Ok(LockGuard { _file: Some(file) });
+			}
+			if Instant::now() >= deadline {
+				return Err(Busy);
+			}
+			std::thread::sleep(Duration::from_millis(2));
+		}
+	}
 
-    /// The GPU lock: swap and bench both take it, so they are mutually exclusive.
-    pub fn gpu() -> Result<LockGuard, Busy> {
-        Self::acquire(gpu_lock())
-    }
+	/// The GPU lock: swap and bench both take it, so they are mutually exclusive.
+	pub fn gpu() -> Result<LockGuard, Busy> {
+		Self::acquire(gpu_lock())
+	}
 
-    /// The build (compile) lock - independent of the GPU lock.
-    pub fn build() -> Result<LockGuard, Busy> {
-        Self::acquire(build_lock())
-    }
+	/// The build (compile) lock - independent of the GPU lock.
+	pub fn build() -> Result<LockGuard, Busy> {
+		Self::acquire(build_lock())
+	}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+	use super::*;
 
-    // One serial test on ISOLATED lock paths (not the shared gpu/build locks, so
-    // it can't race the other tests, which now take real flocks).
-    #[test]
-    fn flock_is_exclusive_releases_and_independent() {
-        let base = std::env::temp_dir().join(format!("llmtune-locktest-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let a = base.join("a.lock");
-        let b = base.join("b.lock");
+	// One serial test on ISOLATED lock paths (not the shared gpu/build locks, so
+	// it can't race the other tests, which now take real flocks).
+	#[test]
+	fn flock_is_exclusive_releases_and_independent() {
+		let base = std::env::temp_dir().join(format!("llmtune-locktest-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&base);
+		let a = base.join("a.lock");
+		let b = base.join("b.lock");
 
-        let g = LockGuard::acquire(a.clone()).expect("first acquire succeeds");
-        // flock is per open-file-description: a distinct open of the same path
-        // must be denied while the first is held.
-        assert!(
-            LockGuard::acquire(a.clone()).is_err(),
-            "second acquire is Busy"
-        );
-        // A different lock file is unaffected.
-        assert!(
-            LockGuard::acquire(b.clone()).is_ok(),
-            "distinct lock is free"
-        );
+		let g = LockGuard::acquire(a.clone()).expect("first acquire succeeds");
+		// flock is per open-file-description: a distinct open of the same path
+		// must be denied while the first is held.
+		assert!(
+			LockGuard::acquire(a.clone()).is_err(),
+			"second acquire is Busy"
+		);
+		// A different lock file is unaffected.
+		assert!(
+			LockGuard::acquire(b.clone()).is_ok(),
+			"distinct lock is free"
+		);
 
-        drop(g);
-        assert!(
-            LockGuard::acquire(a).is_ok(),
-            "released on drop -> reacquirable"
-        );
-        let _ = std::fs::remove_dir_all(&base);
-    }
+		drop(g);
+		assert!(
+			LockGuard::acquire(a).is_ok(),
+			"released on drop -> reacquirable"
+		);
+		let _ = std::fs::remove_dir_all(&base);
+	}
 }
