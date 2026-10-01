@@ -11,6 +11,25 @@ each item can be flagged and replaced with an OpenRC-compatible path.
 
 ---
 
+## Abstraction: the `Actuator` trait
+
+The `swap()` function in `src/swap.rs` is init-system-agnostic — it talks
+only to the `Actuator` trait, not to systemd directly. Different implementations
+drive the same swap logic:
+
+→ `Actuator` trait (src/swap.rs:62) — four methods: `stage()`, `rollback()`,
+`commit()`, `reload_restart()` — abstracts unit reconfiguration + bounce
+→ `SystemdActuator` (src/swap.rs:~919) — implements `Actuator` for systemd
+via drop-ins in `/etc/systemd/system` or `/run/systemd/system`
+→ OpenRC impl — would implement `Actuator` via `/etc/conf.d/` edits +
+`rc-service` restart, following the same swap flow
+→ `swap()` (src/swap.rs:~300) uses `Actuator` for stage/rollback/reload,
+so no init-system branching is needed in the swap logic itself
+→ One place where init system matters inside `swap()`: the error message
+at line ~436 now says "systemd" or "OpenRC" dynamically via `is_systemd()`
+
+---
+
 ## swap.rs — Core systemd integration (highest impact)
 
 ### Constants

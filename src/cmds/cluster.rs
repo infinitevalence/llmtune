@@ -341,7 +341,11 @@ pub(crate) fn cmd_cluster_up(
         ..Default::default()
     };
     let mut wctl = cluster::RealWorkerCtl::new();
-    let mut head_act = swap::SystemdActuator::new();
+    let mut head_act = if crate::init::is_systemd() {
+	  swap::AnyActuator::Systemd(swap::SystemdActuator::new())
+	} else {
+	  swap::AnyActuator::Openrc(swap::OpenrcActuator::new())
+	};
     let head_health = swap::HttpHealth {
         url: head.llama_url.clone(),
     };

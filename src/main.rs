@@ -19,6 +19,7 @@ mod endpoint;
 mod fmt;
 mod history;
 mod identity;
+mod init;
 mod library;
 mod llama;
 mod lock;

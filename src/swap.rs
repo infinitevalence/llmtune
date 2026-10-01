@@ -6,6 +6,7 @@
 //! and bounced) and a [`Health`] probe (how we tell whether the new model came
 //! up), so the swap logic is unit-tested with mocks - no BC-250 required.
 
+use crate::init::is_systemd;
 use crate::llama;
 use crate::model::Model;
 use crate::profile::Profile;
@@ -19,57 +20,97 @@ use std::time::{Duration, Instant};
 /// Result of a swap attempt.
 #[derive(Debug, Clone)]
 pub struct SwapOutcome {
-    pub from: Option<String>,
-    pub to: String,
-    pub ok: bool,
-    pub reverted: bool,
-    pub elapsed_secs: f64,
-    pub detail: String,
+	pub from: Option<String>,
+	pub to: String,
+	pub ok: bool,
+	pub reverted: bool,
+	pub elapsed_secs: f64,
+	pub detail: String,
+}
+
+/// Drop-in format for the target init system.
+#[derive(Debug, Clone, Copy)]
+pub enum DropinFormat {
+	Systemd,
+	OpenRC,
 }
 
 /// Knobs for a swap.
 #[derive(Debug, Clone)]
 pub struct SwapOpts {
-    pub host: String,
-    pub port: u16,
-    pub health_attempts: u32,
-    pub health_interval: Duration,
-    pub prewarm: bool,
-    /// The base unit's own `Environment=` (from [`unit_base_env`]): keys the
-    /// profile does not set are carried into the drop-in, so the env reset
-    /// can't strip a declaratively-configured GPU env (the netboot image's
-    /// VK_DRIVER_FILES/VK_LOADER_LAYERS_DISABLE/LD_LIBRARY_PATH - without
-    /// which llama-server silently falls back to CPU).
-    pub base_env: BTreeMap<String, String>,
+	pub host: String,
+	pub port: u16,
+	pub health_attempts: u32,
+	pub health_interval: Duration,
+	pub prewarm: bool,
+	/// The base unit's own `Environment=` (from [`unit_base_env`]): keys the
+	/// profile does not set are carried into the drop-in, so the env reset
+	/// can't strip a declaratively-configured GPU env (the netboot image's
+	/// VK_DRIVER_FILES/VK_LOADER_LAYERS_DISABLE/LD_LIBRARY_PATH - without
+	/// which llama-server silently falls back to CPU).
+	pub base_env: BTreeMap<String, String>,
 }
 
 impl Default for SwapOpts {
-    fn default() -> Self {
-        SwapOpts {
-            host: "127.0.0.1".to_string(),
-            port: 8080,
-            health_attempts: 24,
-            health_interval: Duration::from_secs(5),
-            prewarm: true,
-            base_env: BTreeMap::new(),
-        }
-    }
+	fn default() -> Self {
+		SwapOpts {
+			host: "127.0.0.1".to_string(),
+			port: 8080,
+			health_attempts: 24,
+			health_interval: Duration::from_secs(5),
+			prewarm: true,
+			base_env: BTreeMap::new(),
+		}
+	}
 }
 
 /// Reconfigures and bounces the llama service. `stage` saves the prior config so
 /// `rollback` can restore it exactly; `commit` discards the saved prior on success.
 pub trait Actuator {
-    fn stage(&mut self, unit: &str, dropin: &str) -> Result<()>;
-    fn rollback(&mut self, unit: &str) -> Result<()>;
-    fn commit(&mut self) -> Result<()>;
-    fn reload_restart(&mut self, unit: &str) -> Result<()>;
+	fn stage(&mut self, unit: &str, dropin: &str) -> Result<()>;
+	fn rollback(&mut self, unit: &str) -> Result<()>;
+	fn commit(&mut self) -> Result<()>;
+	fn reload_restart(&mut self, unit: &str) -> Result<()>;
+}
+
+/// Either systemd or OpenRC actuator — pick at init detection time.
+pub enum AnyActuator {
+	Systemd(SystemdActuator),
+	Openrc(OpenrcActuator),
+}
+
+impl Actuator for AnyActuator {
+	fn stage(&mut self, unit: &str, dropin: &str) -> Result<()> {
+		match self {
+			AnyActuator::Systemd(a) => a.stage(unit, dropin),
+			AnyActuator::Openrc(a) => a.stage(unit, dropin),
+		}
+	}
+	fn rollback(&mut self, unit: &str) -> Result<()> {
+		match self {
+			AnyActuator::Systemd(a) => a.rollback(unit),
+			AnyActuator::Openrc(a) => a.rollback(unit),
+		}
+	}
+	fn commit(&mut self) -> Result<()> {
+		match self {
+			AnyActuator::Systemd(a) => a.commit(),
+			AnyActuator::Openrc(a) => a.commit(),
+		}
+	}
+	fn reload_restart(&mut self, unit: &str) -> Result<()> {
+		match self {
+			AnyActuator::Systemd(a) => a.reload_restart(unit),
+			AnyActuator::Openrc(a) => a.reload_restart(unit),
+		}
+	}
 }
 
 /// Probes a running llama server.
 pub trait Health {
-    fn healthy(&self) -> bool;
-    fn served(&self) -> Option<String>;
-    fn warm(&self);
+	fn healthy(&self) -> bool;
+	fn served(&self) -> Option<String>;
+	fn warm(&self);
 }
 
 /// Render the systemd drop-in for serving `model` under `profile`. Pure function
@@ -79,70 +120,97 @@ pub trait Health {
 /// references a managed build is resolved by the caller, not here.
 #[allow(clippy::too_many_arguments)] // a render is one call site per caller; a params struct would obscure it
 pub fn render_dropin(
-    profile: &Profile,
-    bin: &str,
-    ld: Option<&str>,
-    flags: &str,
-    model_path: &Path,
-    host: &str,
-    port: u16,
-    base_env: &BTreeMap<String, String>,
+	profile: &Profile,
+	bin: &str,
+	ld: Option<&str>,
+	flags: &str,
+	model_path: &Path,
+	host: &str,
+	port: u16,
+	base_env: &BTreeMap<String, String>,
+	fmt: DropinFormat,
 ) -> String {
-    let mut s = String::new();
-    // The MODEL_MARKER tags this as the model-select drop-in, the ONLY one stage()
-    // replaces on a swap. Safety config drop-ins (safe fallback, crash-loop guard)
-    // carry the generic llmtune marker but NOT this one, so they're never nuked.
-    s.push_str("# AUTO-GENERATED by llmtune [model-select]. Per-arch launch. Do not edit.\n");
-    s.push_str("[Service]\n");
-    // Clean takeover: a bare `Environment=` resets the inherited list, so a
-    // coexisting manager's drop-in Environment= lines (e.g. another model-select)
-    // can't bleed into our launch. We then re-declare the full per-arch env, so
-    // the resulting environment is deterministic regardless of what else is staged.
-    // The reset would ALSO strip the base unit's own Environment= (on the netboot
-    // image that is the whole gfx1013 Vulkan stack: VK_DRIVER_FILES -> mesa26 RADV
-    // ICD, VK_LOADER_LAYERS_DISABLE=*, LD_LIBRARY_PATH), silently dropping the
-    // server to CPU - so `base_env` keys the profile does not set are re-declared
-    // too. Precedence: base unit < resolved ld < profile env (later wins).
-    s.push_str("Environment=\n");
-    // BTreeMap -> deterministic key order.
-    for (k, v) in merged_env(base_env, ld, &profile.env) {
-        s.push_str(&env_line(&k, &v));
-    }
-    // `-m` always gets model_path in full (below), but a profile/override's
-    // flags are authored text - a companion-file flag (`--mmproj`,
-    // `--chat-template-file`, `--lora`, ...) commonly names its file bare
-    // (the way the user typed it running llama-server by hand from inside
-    // the models dir), not by full path. Without a WorkingDirectory, systemd
-    // defaults the unit's cwd to `/`, so that bare name resolves to nothing
-    // and llama-server fails to start - while the identical flags work fine
-    // run manually from the models dir. Reported live in aibc250 (Scent,
-    // 2026-09-14): `--mmproj Model-mmproj-Q8_0.gguf` failed under llmtune,
-    // loaded fine run by hand. Set the cwd to the model's own directory so
-    // any bare filename in the flags resolves the way the user expects.
-    if let Some(dir) = model_path.parent() {
-        s.push_str(&format!("WorkingDirectory={}\n", dir.display()));
-    }
-    s.push_str("ExecStart=\n");
-    // Quote the binary + model path so a space in either can't split the argv
-    // systemd builds from ExecStart. Flags are authored (profile/override), so
-    // they stay unquoted - they intentionally carry their own word boundaries.
-    // `stdbuf -oL -eL`: llama-server (like most C/C++ stdio) line-buffers its
-    // console log when stdout is a real terminal but fully block-buffers it
-    // once stdout is a pipe (systemd's journald capture) - so `node logs`/
-    // `journalctl -f` would show the SAME lines, just batched and delayed,
-    // instead of live as printed. Reported live in aibc250 (Scent,
-    // 2026-09-15): running by hand streamed output immediately, the same
-    // model under llmtune didn't. Forces line buffering regardless of what
-    // stdout is connected to, so journald gets each line as it's printed.
-    s.push_str(&format!(
-        "ExecStart=stdbuf -oL -eL \"{}\" -m \"{}\" --host {} --port {} {}\n",
-        bin,
-        model_path.display(),
-        host,
-        port,
-        flags
-    ));
-    s
+	let mut s = String::new();
+	// The MODEL_MARKER tags this as the model-select drop-in, the ONLY one stage()
+	// replaces on a swap. Safety config drop-ins (safe fallback, crash-loop guard)
+	// carry the generic llmtune marker but NOT this one, so they're never nuked.
+	s.push_str("# AUTO-GENERATED by llmtune [model-select]. Per-arch launch. Do not edit.\n");
+	match fmt {
+		DropinFormat::Systemd => {
+			s.push_str("[Service]\n");
+			// Clean takeover: a bare `Environment=` resets the inherited list, so a
+			// coexisting manager's drop-in Environment= lines (e.g. another model-select)
+			// can't bleed into our launch. We then re-declare the full per-arch env, so
+			// the resulting environment is deterministic regardless of what else is staged.
+			// The reset would ALSO strip the base unit's own Environment= (on the netboot
+			// image that is the whole gfx1013 Vulkan stack: VK_DRIVER_FILES -> mesa26 RADV
+			// ICD, VK_LOADER_LAYERS_DISABLE=*, LD_LIBRARY_PATH), silently dropping the
+			// server to CPU - so `base_env` keys the profile does not set are re-declared
+			// too. Precedence: base unit < resolved ld < profile env (later wins).
+			s.push_str("Environment=\n");
+		}
+		DropinFormat::OpenRC => {
+			// OpenRC /etc/conf.d/{unit}: export lines only, no section headers.
+			// No env-reset needed: OpenRC doesn't inherit across conf.d files.
+		}
+	}
+	// BTreeMap -> deterministic key order.
+	for (k, v) in merged_env(base_env, ld, &profile.env) {
+		s.push_str(&env_line(&k, &v, fmt));
+	}
+	// `-m` always gets model_path in full (below), but a profile/override's
+	// flags are authored text - a companion-file flag (`--mmproj`,
+	// `--chat-template-file`, `--lora`, ...) commonly names its file bare
+	// (the way the user typed it running llama-server by hand from inside
+	// the models dir), not by full path. Without a WorkingDirectory, systemd
+	// defaults the unit's cwd to `/`, so that bare name resolves to nothing
+	// and llama-server fails to start - while the identical flags work fine
+	// run manually from the models dir. Reported live in aibc250 (Scent,
+	// 2026-09-14): `--mmproj Model-mmproj-Q8_0.gguf` failed under llmtune,
+	// loaded fine run by hand. Set the cwd to the model's own directory so
+	// any bare filename in the flags resolves the way the user expects.
+	if let Some(dir) = model_path.parent() {
+		s.push_str(&cwd_line(dir.display(), fmt));
+	}
+	match fmt {
+		DropinFormat::Systemd => {
+			s.push_str("ExecStart=\n");
+		}
+		DropinFormat::OpenRC => {
+			// OpenRC: `command_args` is appended to the init script's command.
+		}
+	}
+	// Quote the binary + model path so a space in either can't split the argv
+	// systemd builds from ExecStart. Flags are authored (profile/override), so
+	// they stay unquoted - they intentionally carry their own word boundaries.
+	// `stdbuf -oL -eL`: llama-server (like most C/C++ stdio) line-buffers its
+	// console log when stdout is a real terminal but fully block-buffers it
+	// once stdout is a pipe (systemd's journald capture) - so `node logs`/
+	// `journalctl -f` would show the SAME lines, just batched and delayed,
+	// instead of live as printed. Reported live in aibc250 (Scent,
+	// 2026-09-15): running by hand streamed output immediately, the same
+	// model under llmtune didn't. Forces line buffering regardless of what
+	// stdout is connected to, so journald gets each line as it's printed.
+	let line = match fmt {
+		DropinFormat::Systemd => format!(
+			"ExecStart=stdbuf -oL -eL \"{}\" -m \"{}\" --host {} --port {} {}\n",
+			bin,
+			model_path.display(),
+			host,
+			port,
+			flags
+		),
+		DropinFormat::OpenRC => format!(
+			"command_args=\"stdbuf -oL -eL \"{}\" -m \"{}\" --host {} --port {} {}\"\n",
+			bin,
+			model_path.display(),
+			host,
+			port,
+			flags
+		),
+	};
+	s.push_str(&line);
+	s
 }
 
 /// Merge the drop-in environment: the base unit's own `Environment=` keys,
@@ -151,50 +219,76 @@ pub fn render_dropin(
 /// win; everything else the base unit declared is carried over so the drop-in's
 /// env reset can't strip it (see [`render_dropin`]).
 pub(crate) fn merged_env(
-    base: &BTreeMap<String, String>,
-    ld: Option<&str>,
-    profile_env: &BTreeMap<String, String>,
+	base: &BTreeMap<String, String>,
+	ld: Option<&str>,
+	profile_env: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    let mut m = base.clone();
-    if let Some(ld) = ld {
-        m.insert("LD_LIBRARY_PATH".to_string(), ld.to_string());
-    }
-    for (k, v) in profile_env {
-        m.insert(k.clone(), v.clone());
-    }
-    m
+	let mut m = base.clone();
+	if let Some(ld) = ld {
+		m.insert("LD_LIBRARY_PATH".to_string(), ld.to_string());
+	}
+	for (k, v) in profile_env {
+		m.insert(k.clone(), v.clone());
+	}
+	m
 }
 
-/// One `Environment=` line. A value with whitespace is carried as systemd's
-/// quoted-assignment form (`Environment="K=V with space"`); everything else
-/// stays in the bare form the existing drop-ins use.
-fn env_line(k: &str, v: &str) -> String {
-    if v.chars().any(|c| c.is_whitespace()) {
-        format!("Environment=\"{k}={v}\"\n")
-    } else {
-        format!("Environment={k}={v}\n")
-    }
+/// WorkingDirectory line for the target format.
+fn cwd_line(dir: impl std::fmt::Display, fmt: DropinFormat) -> String {
+	match fmt {
+		DropinFormat::Systemd => format!("WorkingDirectory={}\n", dir),
+		DropinFormat::OpenRC => format!("workingdir=\"{}\"\n", dir),
+	}
 }
 
-/// The `Environment=` map declared by a unit's OWN definition (its fragment
-/// file) - NOT `systemctl cat`, which would fold in drop-ins: our previous
-/// model-select drop-in starts with an env reset, and a competing manager's
-/// drop-in env must not be treated as the unit's baseline. Best-effort: a
-/// missing unit (or no systemctl) yields an empty map.
+/// One environment line for the target format.
+/// Systemd: `Environment="K=V with space"` or `Environment=K=V`.
+/// OpenRC: `export K="V"` or `K="V"`.
+fn env_line(k: &str, v: &str, fmt: DropinFormat) -> String {
+	match fmt {
+		DropinFormat::Systemd => {
+			if v.chars().any(|c| c.is_whitespace()) {
+				format!("Environment=\"{k}={v}\"\n")
+			} else {
+				format!("Environment={k}={v}\n")
+			}
+		}
+		DropinFormat::OpenRC => {
+			if v.chars().any(|c| c.is_whitespace()) {
+				format!("export {k}=\"{v}\"\n")
+			} else {
+				format!("export {k}={v}\n")
+			}
+		}
+	}
+}
+
+/// The `Environment=` map declared by a unit's OWN definition.
+/// Systemd: reads via `systemctl show -p FragmentPath`.
+/// OpenRC: reads from `/etc/conf.d/{unit}`.
+/// Best-effort: a missing unit (or no systemctl) yields an empty map.
 pub fn unit_base_env(unit: &str) -> BTreeMap<String, String> {
-    let frag = Command::new("systemctl")
-        .args(["show", "-p", "FragmentPath", "--value", unit])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    if frag.is_empty() {
-        return BTreeMap::new();
-    }
-    std::fs::read_to_string(&frag)
-        .map(|t| parse_unit_env(&t))
-        .unwrap_or_default()
+	if is_systemd() {
+		let frag = Command::new("systemctl")
+			.args(["show", "-p", "FragmentPath", "--value", unit])
+			.output()
+			.ok()
+			.and_then(|o| String::from_utf8(o.stdout).ok())
+			.map(|s| s.trim().to_string())
+			.unwrap_or_default();
+		if frag.is_empty() {
+			return BTreeMap::new();
+		}
+		std::fs::read_to_string(&frag)
+			.map(|t| parse_unit_env(&t))
+			.unwrap_or_default()
+	} else {
+		// OpenRC: /etc/conf.d/{unit} uses export K=V or bare K=V
+		let path = format!("/etc/conf.d/{}", unit);
+		std::fs::read_to_string(&path)
+			.map(|t| parse_openrc_env(&t))
+			.unwrap_or_default()
+	}
 }
 
 /// Parse the `[Service] Environment=` assignments out of a unit file's text.
@@ -202,301 +296,335 @@ pub fn unit_base_env(unit: &str) -> BTreeMap<String, String> {
 /// (`Environment="K=v with space"` / `'K=v'`), and the bare-`Environment=`
 /// reset. Sections other than [Service] and comment lines are ignored.
 pub(crate) fn parse_unit_env(text: &str) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    let mut in_service = false;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.starts_with('[') {
-            in_service = line.eq_ignore_ascii_case("[service]");
-            continue;
-        }
-        if !in_service || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("Environment=") else {
-            continue;
-        };
-        let rest = rest.trim();
-        if rest.is_empty() {
-            // a bare Environment= resets everything declared so far
-            env.clear();
-            continue;
-        }
-        for tok in split_quoted(rest) {
-            if let Some((k, v)) = tok.split_once('=') {
-                if !k.is_empty() {
-                    env.insert(k.to_string(), v.to_string());
-                }
-            }
-        }
-    }
-    env
+	let mut env = BTreeMap::new();
+	let mut in_service = false;
+	for raw in text.lines() {
+		let line = raw.trim();
+		if line.starts_with('[') {
+			in_service = line.eq_ignore_ascii_case("[service]");
+			continue;
+		}
+		if !in_service || line.starts_with('#') || line.starts_with(';') {
+			continue;
+		}
+		let Some(rest) = line.strip_prefix("Environment=") else {
+			continue;
+		};
+		let rest = rest.trim();
+		if rest.is_empty() {
+			// a bare Environment= resets everything declared so far
+			env.clear();
+			continue;
+		}
+		for tok in split_quoted(rest) {
+			if let Some((k, v)) = tok.split_once('=') {
+				if !k.is_empty() {
+					env.insert(k.to_string(), v.to_string());
+				}
+			}
+		}
+	}
+	env
+}
+
+/// Parse an OpenRC `/etc/conf.d/{unit}` config.
+/// OpenRC uses `export K=V` or bare `K=V` on each line.
+/// Lines starting with `#` are comments; everything else is stripped and
+/// split on the first `=`.
+pub(crate) fn parse_openrc_env(text: &str) -> BTreeMap<String, String> {
+	let mut env = BTreeMap::new();
+	for raw in text.lines() {
+		let line = raw.trim();
+		if line.starts_with('#') {
+			continue;
+		}
+		let stripped = line
+			.strip_prefix("export ")
+			.unwrap_or(line);
+		if let Some((k, v)) = stripped.split_once('=') {
+			if !k.is_empty() {
+				env.insert(k.to_string(), v.to_string());
+			}
+		}
+	}
+	env
 }
 
 /// Split on whitespace, honoring double/single quotes (quotes stripped).
 fn split_quoted(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quote: Option<char> = None;
-    for c in s.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => cur.push(c),
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c.is_whitespace() => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            None => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
+	let mut out = Vec::new();
+	let mut cur = String::new();
+	let mut quote: Option<char> = None;
+	for c in s.chars() {
+		match quote {
+			Some(q) if c == q => quote = None,
+			Some(_) => cur.push(c),
+			None if c == '"' || c == '\'' => quote = Some(c),
+			None if c.is_whitespace() => {
+				if !cur.is_empty() {
+					out.push(std::mem::take(&mut cur));
+				}
+			}
+			None => cur.push(c),
+		}
+	}
+	if !cur.is_empty() {
+		out.push(cur);
+	}
+	out
 }
 
 /// Apply the BC-250 memory guard: a dense qwen35 (not the MoE) with big Q8-ish
 /// weights (>9 GiB) plus a 98304 KV OOMs the 16 GiB UMA, so shrink its window to
 /// the proven-safe 32768. Returns the (possibly adjusted) flags.
 pub fn adjust_flags(profile: &Profile, model: &Model) -> String {
-    let mut flags = profile.flags.clone();
-    let a = model.arch.to_lowercase();
-    if a.starts_with("qwen35")
-        && !a.starts_with("qwen35moe")
-        && model.size_bytes > 9_000_000_000
-        && flags.contains("-c 98304")
-    {
-        flags = flags.replace("-c 98304", "-c 32768");
-    }
-    // A qwen35 model without MTP layers (e.g. a fine-tune/distill) cannot be
-    // served with the profile's `--spec-type draft-mtp` - llama-server aborts
-    // with "context type MTP requested but model doesn't contain MTP layers" and
-    // the load crash-loops until the health poll times out (~130s) and reverts.
-    // Strip the speculative-draft flags so it loads (plain decode, no MTP speedup).
-    if !model.has_mtp {
-        flags = strip_mtp_flags(&flags);
-    }
-    flags
+	let mut flags = profile.flags.clone();
+	let a = model.arch.to_lowercase();
+	if a.starts_with("qwen35")
+		&& !a.starts_with("qwen35moe")
+		&& model.size_bytes > 9_000_000_000
+		&& flags.contains("-c 98304")
+	{
+		flags = flags.replace("-c 98304", "-c 32768");
+	}
+	// A qwen35 model without MTP layers (e.g. a fine-tune/distill) cannot be
+	// served with the profile's `--spec-type draft-mtp` - llama-server aborts
+	// with "context type MTP requested but model doesn't contain MTP layers" and
+	// the load crash-loops until the health poll times out (~130s) and reverts.
+	// Strip the speculative-draft flags so it loads (plain decode, no MTP speedup).
+	if !model.has_mtp {
+		flags = strip_mtp_flags(&flags);
+	}
+	flags
 }
 
 /// Remove the MTP speculative-draft flags (`--spec-type`, `--spec-draft-*`) and
 /// their values from a flag string, leaving the rest untouched. Used when the
 /// served model has no MTP layers so `--spec-type draft-mtp` would abort the load.
 fn strip_mtp_flags(flags: &str) -> String {
-    let toks: Vec<&str> = flags.split_whitespace().collect();
-    let mut out: Vec<&str> = Vec::with_capacity(toks.len());
-    let mut i = 0;
-    while i < toks.len() {
-        let t = toks[i];
-        if t == "--spec-type" || t.starts_with("--spec-draft") {
-            // drop the flag, and a following value if it isn't itself a flag
-            if toks.get(i + 1).is_some_and(|n| !n.starts_with('-')) {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        out.push(t);
-        i += 1;
-    }
-    out.join(" ")
+	let toks: Vec<&str> = flags.split_whitespace().collect();
+	let mut out: Vec<&str> = Vec::with_capacity(toks.len());
+	let mut i = 0;
+	while i < toks.len() {
+		let t = toks[i];
+		if t == "--spec-type" || t.starts_with("--spec-draft") {
+			// drop the flag, and a following value if it isn't itself a flag
+			if toks.get(i + 1).is_some_and(|n| !n.starts_with('-')) {
+				i += 1;
+			}
+			i += 1;
+			continue;
+		}
+		out.push(t);
+		i += 1;
+	}
+	out.join(" ")
 }
 
 /// Swap the served model to `model` using `flags` (the caller resolves these -
 /// a per-model override, or the profile's memory-guarded flags). Health-checked
 /// with auto-revert.
 pub fn swap<A: Actuator, H: Health>(
-    unit: &str,
-    model: &Model,
-    profile: &Profile,
-    flags: &str,
-    opts: &SwapOpts,
-    act: &mut A,
-    health: &H,
+	unit: &str,
+	model: &Model,
+	profile: &Profile,
+	flags: &str,
+	opts: &SwapOpts,
+	act: &mut A,
+	health: &H,
 ) -> Result<SwapOutcome> {
-    let start = Instant::now();
-    let from = health.served();
-    if from.as_deref() == Some(model.name.as_str()) {
-        return Ok(SwapOutcome {
-            from: from.clone(),
-            to: model.name.clone(),
-            ok: true,
-            reverted: false,
-            elapsed_secs: 0.0,
-            detail: format!("`{}` is already served", model.name),
-        });
-    }
+	let start = Instant::now();
+	let from = health.served();
+	if from.as_deref() == Some(model.name.as_str()) {
+		return Ok(SwapOutcome {
+			from: from.clone(),
+			to: model.name.clone(),
+			ok: true,
+			reverted: false,
+			elapsed_secs: 0.0,
+			detail: format!("`{}` is already served", model.name),
+		});
+	}
 
-    let (bin, ld) = profile.launch();
-    // A bare binary name (no path) means the profile's `build` is referenced but
-    // not installed - launch() returns the bare name as a signal. Staging that
-    // would spawn `ExecStart=llama-server`, which 203/EXECs and crash-loops until
-    // the health poll times out (~130s) with a misleading "didn't fit memory".
-    // Fail fast with an actionable message instead.
-    if !bin.contains('/') {
-        anyhow::bail!(
-            "profile `{}` can't resolve a llama-server binary: build `{}` is not installed. \
-             Install it (`llmtune build install {}`), or point the profile at an existing \
-             binary (`llmtune profile set {} --bin /path/to/llama-server`).",
-            profile.id,
-            profile.build.as_deref().unwrap_or("?"),
-            profile.build.as_deref().unwrap_or("?"),
-            profile.id
-        );
-    }
-    let dropin = render_dropin(
-        profile,
-        &bin,
-        ld.as_deref(),
-        flags,
-        &model.path,
-        &opts.host,
-        opts.port,
-        &opts.base_env,
-    );
-    // Stage the new drop-in and restart. If EITHER step errors, the previous
-    // drop-in has already been removed/replaced, so roll back before returning -
-    // otherwise a systemctl failure strands the node with a bad (or no) config.
-    if let Err(e) = act
-        .stage(unit, &dropin)
-        .and_then(|()| act.reload_restart(unit))
-    {
-        // Report whether the revert actually succeeded - don't claim "reverted"
-        // if the rollback itself failed (the node may be stranded).
-        let reverted = act
-            .rollback(unit)
-            .and_then(|()| act.reload_restart(unit))
-            .is_ok();
-        let _ = poll_health(health, opts);
-        let detail = if reverted {
-            format!("staging/restart failed ({e}); reverted to the previous model")
-        } else {
-            format!("staging/restart failed ({e}) AND the revert failed - the node may be stranded")
-        };
-        return Ok(SwapOutcome {
-            from,
-            to: model.name.clone(),
-            ok: false,
-            reverted,
-            elapsed_secs: start.elapsed().as_secs_f64(),
-            detail,
-        });
-    }
+	let (bin, ld) = profile.launch();
+	// A bare binary name (no path) means the profile's `build` is referenced but
+	// not installed - launch() returns the bare name as a signal. Staging that
+	// would spawn `ExecStart=llama-server`, which 203/EXECs and crash-loops until
+	// the health poll times out (~130s) with a misleading "didn't fit memory".
+	// Fail fast with an actionable message instead.
+	if !bin.contains('/') {
+		anyhow::bail!(
+			"profile `{}` can't resolve a llama-server binary: build `{}` is not installed. \
+			 Install it (`llmtune build install {}`), or point the profile at an existing \
+			 binary (`llmtune profile set {} --bin /path/to/llama-server`).",
+			profile.id,
+			profile.build.as_deref().unwrap_or("?"),
+			profile.build.as_deref().unwrap_or("?"),
+			profile.id
+		);
+	}
+	let dropin = render_dropin(
+		profile,
+		&bin,
+		ld.as_deref(),
+		flags,
+		&model.path,
+		&opts.host,
+		opts.port,
+		&opts.base_env,
+		if is_systemd() {
+			DropinFormat::Systemd
+		} else {
+			DropinFormat::OpenRC
+		},
+	);
+	// Stage the new drop-in and restart. If EITHER step errors, the previous
+	// drop-in has already been removed/replaced, so roll back before returning -
+	// otherwise a systemctl failure strands the node with a bad (or no) config.
+	if let Err(e) = act
+		.stage(unit, &dropin)
+		.and_then(|()| act.reload_restart(unit))
+	{
+		// Report whether the revert actually succeeded - don't claim "reverted"
+		// if the rollback itself failed (the node may be stranded).
+		let reverted = act
+			.rollback(unit)
+			.and_then(|()| act.reload_restart(unit))
+			.is_ok();
+		let _ = poll_health(health, opts);
+		let detail = if reverted {
+			format!("staging/restart failed ({e}); reverted to the previous model")
+		} else {
+			format!("staging/restart failed ({e}) AND the revert failed - the node may be stranded")
+		};
+		return Ok(SwapOutcome {
+			from,
+			to: model.name.clone(),
+			ok: false,
+			reverted,
+			elapsed_secs: start.elapsed().as_secs_f64(),
+			detail,
+		});
+	}
 
-    if poll_health(health, opts) {
-        // Verify the swap actually took: if the server reports a different model,
-        // the drop-in did not win (a competing drop-in sorts later, or the unit
-        // ignored ours) - that is a FAILED swap, so revert rather than claim success.
-        if let Some(s) = health.served() {
-            if s != model.name {
-                // Same revert-diagnosis discipline as the stage-failure path
-                // above: report whether the rollback itself succeeded instead
-                // of propagating a raw error that hides WHY the node may be
-                // stranded.
-                let reverted = act
-                    .rollback(unit)
-                    .and_then(|()| act.reload_restart(unit))
-                    .is_ok();
-                let _ = poll_health(health, opts);
-                let why = format!(
-                    "swap did not take - server still serves `{s}`, not `{}` \
-                     (a competing systemd drop-in is overriding llmtune's)",
-                    model.name
-                );
-                let detail = if reverted {
-                    format!("{why}; reverted")
-                } else {
-                    format!("{why} AND the revert failed - the node may be stranded")
-                };
-                return Ok(SwapOutcome {
-                    from,
-                    to: model.name.clone(),
-                    ok: false,
-                    reverted,
-                    elapsed_secs: start.elapsed().as_secs_f64(),
-                    detail,
-                });
-            }
-        }
-        if opts.prewarm {
-            health.warm();
-        }
-        act.commit()?;
-        return Ok(SwapOutcome {
-            from,
-            to: model.name.clone(),
-            ok: true,
-            reverted: false,
-            elapsed_secs: start.elapsed().as_secs_f64(),
-            detail: format!(
-                "loaded `{}` [{}], serving on {}:{}",
-                model.name, model.arch, opts.host, opts.port
-            ),
-        });
-    }
+	if poll_health(health, opts) {
+		// Verify the swap actually took: if the server reports a different model,
+		// the drop-in did not win (a competing drop-in sorts later, or the unit
+		// ignored ours) - that is a FAILED swap, so revert rather than claim success.
+		if let Some(s) = health.served() {
+			if s != model.name {
+				// Same revert-diagnosis discipline as the stage-failure path
+				// above: report whether the rollback itself succeeded instead
+				// of propagating a raw error that hides WHY the node may be
+				// stranded.
+				let reverted = act
+					.rollback(unit)
+					.and_then(|()| act.reload_restart(unit))
+					.is_ok();
+				let _ = poll_health(health, opts);
+				let why = format!(
+					"swap did not take - server still serves `{s}`, not `{}` \
+					 (a competing {} drop-in is overriding llmtune's)",
+					model.name,
+					if is_systemd() { "systemd" } else { "OpenRC" }
+				);
+				let detail = if reverted {
+					format!("{why}; reverted")
+				} else {
+					format!("{why} AND the revert failed - the node may be stranded")
+				};
+				return Ok(SwapOutcome {
+					from,
+					to: model.name.clone(),
+					ok: false,
+					reverted,
+					elapsed_secs: start.elapsed().as_secs_f64(),
+					detail,
+				});
+			}
+		}
+		if opts.prewarm {
+			health.warm();
+		}
+		act.commit()?;
+		return Ok(SwapOutcome {
+			from,
+			to: model.name.clone(),
+			ok: true,
+			reverted: false,
+			elapsed_secs: start.elapsed().as_secs_f64(),
+			detail: format!(
+				"loaded `{}` [{}], serving on {}:{}",
+				model.name, model.arch, opts.host, opts.port
+			),
+		});
+	}
 
-    // Load failed (unsupported arch/quant, OOM, bad flags). Revert - and
-    // report whether the revert itself worked (same discipline as above).
-    let reverted = act
-        .rollback(unit)
-        .and_then(|()| act.reload_restart(unit))
-        .is_ok();
-    let _ = poll_health(health, opts);
-    let why = format!(
-        "`{}` [{}] FAILED to load (arch/quant unsupported, or did not fit memory)",
-        model.name, model.arch
-    );
-    let detail = if reverted {
-        let prev = health.served().unwrap_or_else(|| "unknown".to_string());
-        format!("{why} - reverted to `{prev}`")
-    } else {
-        format!("{why} AND the revert failed - the node may be stranded")
-    };
-    Ok(SwapOutcome {
-        from,
-        to: model.name.clone(),
-        ok: false,
-        reverted,
-        elapsed_secs: start.elapsed().as_secs_f64(),
-        detail,
-    })
+	// Load failed (unsupported arch/quant, OOM, bad flags). Revert - and
+	// report whether the revert itself worked (same discipline as above).
+	let reverted = act
+		.rollback(unit)
+		.and_then(|()| act.reload_restart(unit))
+		.is_ok();
+	let _ = poll_health(health, opts);
+	let why = format!(
+		"`{}` [{}] FAILED to load (arch/quant unsupported, or did not fit memory)",
+		model.name, model.arch
+	);
+	let detail = if reverted {
+		let prev = health.served().unwrap_or_else(|| "unknown".to_string());
+		format!("{why} - reverted to `{prev}`")
+	} else {
+		format!("{why} AND the revert failed - the node may be stranded")
+	};
+	Ok(SwapOutcome {
+		from,
+		to: model.name.clone(),
+		ok: false,
+		reverted,
+		elapsed_secs: start.elapsed().as_secs_f64(),
+		detail,
+	})
 }
 
 /// Poll a health probe up to `opts.health_attempts` times. Public so cluster
 /// orchestration can reuse it for the head node.
 pub fn poll_health<H: Health>(health: &H, opts: &SwapOpts) -> bool {
-    for i in 0..opts.health_attempts {
-        if health.healthy() {
-            return true;
-        }
-        if i + 1 < opts.health_attempts {
-            std::thread::sleep(opts.health_interval);
-        }
-    }
-    false
+	for i in 0..opts.health_attempts {
+		if health.healthy() {
+			return true;
+		}
+		if i + 1 < opts.health_attempts {
+			std::thread::sleep(opts.health_interval);
+		}
+	}
+	false
 }
+
 
 /// Remove ALL llmtune drop-ins for a unit and bounce it (used by `cluster
 /// down` to return the head to its base, non-clustered config).
 pub fn clear_dropin(unit: &str) -> Result<()> {
-    // Remove EVERY llmtune drop-in (model-select + safe fallback + crash-loop
-    // guard), not just the model-select one: while the safe-fallback conf is
-    // present the effective ExecStart stays `/bin/false`, so a plain restart
-    // would leave the old llama-server process running with the model still
-    // resident in VRAM. With all llmtune drop-ins gone the base unit's own
-    // ExecStart returns and the restart actually stops the server.
-    let (ours, _) = collect_dropins_llmtune(unit);
-    for p in ours {
-        sudo(&["rm", "-f", &p.to_string_lossy()])?;
-    }
-    sudo(&["systemctl", "daemon-reload"])?;
-    // Clear any start-limit-hit from a prior crash-loop so a new (good) model
-    // can start instead of being refused by the crash-loop guard.
-    let _ = sudo(&["systemctl", "reset-failed", unit]);
-    sudo(&["systemctl", "restart", unit])?;
-    Ok(())
+	// Remove EVERY llmtune drop-in (model-select + safe fallback + crash-loop
+	// guard), not just the model-select one: while the safe-fallback conf is
+	// present the effective ExecStart stays `/bin/false`, so a plain restart
+	// would leave the old llama-server process running with the model still
+	// resident in VRAM. With all llmtune drop-ins gone the base unit's own
+	// ExecStart returns and the restart actually stops the server.
+	let (ours, _) = collect_dropins_llmtune(unit);
+	for p in ours {
+		sudo(&["rm", "-f", &p.to_string_lossy()])?;
+	}
+	if is_systemd() {
+		sudo(&["systemctl", "daemon-reload"])?;
+		// Clear any start-limit-hit from a prior crash-loop so a new (good) model
+		// can start instead of being refused by the crash-loop guard.
+		let _ = sudo(&["systemctl", "reset-failed", unit]);
+		sudo(&["systemctl", "restart", unit])?;
+	} else {
+		sudo(&["rc-service", unit, "restart"])?;
+	}
+	Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -516,11 +644,11 @@ const VENDOR_UNIT_DIRS: &[&str] = &["/usr/lib/systemd/system", "/lib/systemd/sys
 /// netboot image (read-only /etc), where a /run drop-in is exactly right: the
 /// declarative unit is the durable config, a swap is a runtime override.
 pub fn unit_install_dir() -> &'static str {
-    if etc_units_writable() {
-        ETC_UNIT_DIR
-    } else {
-        RUN_UNIT_DIR
-    }
+	if etc_units_writable() {
+		ETC_UNIT_DIR
+	} else {
+		RUN_UNIT_DIR
+	}
 }
 
 /// Whether `/etc/systemd/system` can be written. Three independent tells, any
@@ -531,60 +659,60 @@ pub fn unit_install_dir() -> &'static str {
 /// - `/etc/systemd/system` resolves into `/nix/store` (read-only store)
 /// - the mount holding `/etc/systemd/system` is mounted `ro`
 fn etc_units_writable() -> bool {
-    let nixos = Path::new("/etc/NIXOS").exists();
-    let canon = std::fs::canonicalize(ETC_UNIT_DIR).ok();
-    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-    etc_units_writable_from(nixos, canon.as_deref(), &mounts)
+	let nixos = Path::new("/etc/NIXOS").exists();
+	let canon = std::fs::canonicalize(ETC_UNIT_DIR).ok();
+	let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+	etc_units_writable_from(nixos, canon.as_deref(), &mounts)
 }
 
 /// Pure core of [`etc_units_writable`] (unit-tested; the caller does the IO).
 fn etc_units_writable_from(nixos_marker: bool, canon: Option<&Path>, mounts: &str) -> bool {
-    if nixos_marker {
-        return false;
-    }
-    if canon.is_some_and(|c| c.starts_with("/nix/store")) {
-        return false;
-    }
-    !mounted_ro(mounts, Path::new(ETC_UNIT_DIR))
+	if nixos_marker {
+		return false;
+	}
+	if canon.is_some_and(|c| c.starts_with("/nix/store")) {
+		return false;
+	}
+	!mounted_ro(mounts, Path::new(ETC_UNIT_DIR))
 }
 
 /// Whether the innermost mount containing `path` is mounted read-only, given
 /// the text of `/proc/self/mounts`. Longest matching mount point wins; among
 /// equal mount points the later line wins (mount order - an overmount).
 fn mounted_ro(mounts: &str, path: &Path) -> bool {
-    let mut best: Option<(usize, bool)> = None;
-    for line in mounts.lines() {
-        let mut f = line.split_whitespace();
-        let (Some(_dev), Some(mp), Some(_fs), Some(opts)) =
-            (f.next(), f.next(), f.next(), f.next())
-        else {
-            continue;
-        };
-        // /proc mount points escape space/tab as \040 / \011.
-        let mp = mp.replace("\\040", " ").replace("\\011", "\t");
-        if path.starts_with(Path::new(&mp)) {
-            let ro = opts.split(',').any(|o| o == "ro");
-            if best.is_none_or(|(len, _)| mp.len() >= len) {
-                best = Some((mp.len(), ro));
-            }
-        }
-    }
-    best.is_some_and(|(_, ro)| ro)
+	let mut best: Option<(usize, bool)> = None;
+	for line in mounts.lines() {
+		let mut f = line.split_whitespace();
+		let (Some(_dev), Some(mp), Some(_fs), Some(opts)) =
+			(f.next(), f.next(), f.next(), f.next())
+		else {
+			continue;
+		};
+		// /proc mount points escape space/tab as \040 / \011.
+		let mp = mp.replace("\\040", " ").replace("\\011", "\t");
+		if path.starts_with(Path::new(&mp)) {
+			let ro = opts.split(',').any(|o| o == "ro");
+			if best.is_none_or(|(len, _)| mp.len() >= len) {
+				best = Some((mp.len(), ro));
+			}
+		}
+	}
+	best.is_some_and(|(_, ro)| ro)
 }
 
 /// The drop-in dir llmtune WRITES to for `unit` (under [`unit_install_dir`]).
 pub(crate) fn dropin_dir(unit: &str) -> PathBuf {
-    PathBuf::from(format!("{}/{unit}.d", unit_install_dir()))
+	PathBuf::from(format!("{}/{unit}.d", unit_install_dir()))
 }
 
 /// Find `name` among the unit's drop-ins across every root systemd merges
 /// (/etc, /run, vendor) - so e.g. doctor doesn't report a /run-installed
 /// guard as missing on the netboot image.
 pub(crate) fn dropin_file(unit: &str, name: &str) -> Option<PathBuf> {
-    dropin_scan_dirs(unit)
-        .into_iter()
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
+	dropin_scan_dirs(unit)
+		.into_iter()
+		.map(|d| d.join(name))
+		.find(|p| p.is_file())
 }
 
 /// Every drop-in dir systemd merges for `unit`, writable root first. systemd
@@ -592,12 +720,12 @@ pub(crate) fn dropin_file(unit: &str, name: &str) -> Option<PathBuf> {
 /// can't be shadowed by a drop-in in another root (e.g. the netboot image's
 /// `bc250-swap` override.conf in /run while llmtune writes /etc, or vice versa).
 fn dropin_scan_dirs(unit: &str) -> Vec<PathBuf> {
-    let mut roots = vec![ETC_UNIT_DIR, RUN_UNIT_DIR];
-    roots.extend(VENDOR_UNIT_DIRS);
-    roots
-        .into_iter()
-        .map(|r| PathBuf::from(format!("{r}/{unit}.d")))
-        .collect()
+	let mut roots = vec![ETC_UNIT_DIR, RUN_UNIT_DIR];
+	roots.extend(VENDOR_UNIT_DIRS);
+	roots
+		.into_iter()
+		.map(|r| PathBuf::from(format!("{r}/{unit}.d")))
+		.collect()
 }
 
 /// Header marker identifying an llmtune-written drop-in.
@@ -617,58 +745,108 @@ const LLMTUNE_PREFIX: &str = "AUTO-GENERATED by llmtune";
 /// sits in a writable root. Used by [`clear_dropin`]: an unload must remove the
 /// whole llmtune layer so the base unit's ExecStart governs again.
 fn collect_dropins_llmtune(unit: &str) -> (Vec<PathBuf>, Vec<String>) {
-    let install = unit_install_dir();
-    let dirs: Vec<(PathBuf, bool)> = dropin_scan_dirs(unit)
-        .into_iter()
-        .map(|d| {
-            // /run is always writable, even when /etc is the chosen install root.
-            let writable = d.starts_with(install) || d.starts_with(RUN_UNIT_DIR);
-            (d, writable)
-        })
-        .collect();
-    collect_dropins_in(&dirs, |t| t.contains(LLMTUNE_PREFIX))
+	if is_systemd() {
+		// systemd: union scan across ALL drop-in roots (/etc, /run, vendor)
+		let install = unit_install_dir();
+		let dirs: Vec<(PathBuf, bool)> = dropin_scan_dirs(unit)
+			.into_iter()
+			.map(|d| {
+				// /run is always writable, even when /etc is the chosen install root.
+				let writable = d.starts_with(install) || d.starts_with(RUN_UNIT_DIR);
+				(d, writable)
+			})
+			.collect();
+		collect_dropins_in(&dirs, |t| t.contains(LLMTUNE_PREFIX))
+	} else {
+		// OpenRC: scan /etc/conf.d/<unit> and sibling conf files in /etc/conf.d/
+		collect_openrc_dropins(unit)
+	}
 }
 
 /// Union scan across every drop-in dir systemd merges for `unit`:
+/// For OpenRC: collect llmtune-marked drop-ins from `/etc/conf.d/<unit>`.
+/// OpenRC uses a single conf file instead of systemd's drop-in directory, so
+/// this scans the directory for any file carrying our marker.
+fn collect_openrc_dropins(unit: &str) -> (Vec<PathBuf>, Vec<String>) {
+	let conf_dir = PathBuf::from(format!("/etc/conf.d/{unit}"));
+	let mut ours = Vec::new();
+	let mut foreign = Vec::new();
+	// OpenRC conf.d/<unit> is a single file, but we also scan the parent
+	// directory for any other llmtune-marked conf files (e.g. safe-fallback
+	// or crash-loop guards that may have been placed there by older llmtune).
+	if let Some(rd) = conf_dir.parent().and_then(|p| std::fs::read_dir(p).ok()) {
+		for e in rd.flatten() {
+			let p = e.path();
+			if p.extension().and_then(|x| x.to_str()) != Some("conf") {
+				continue;
+			}
+			let content = if is_root() {
+				std::fs::read_to_string(&p).unwrap_or_default()
+			} else {
+				Command::new(root_cmd())
+					.args(["cat", &p.to_string_lossy()])
+					.output()
+					.ok()
+					.and_then(|o| String::from_utf8(o.stdout).ok())
+					.unwrap_or_default()
+			};
+			if content.contains(MARKER) {
+				ours.push(p);
+			} else {
+				foreign.push(
+					e.file_name()
+						.to_string_lossy()
+						.into_owned(),
+				);
+			}
+		}
+	}
+	(ours, foreign)
+}
+
+/// llmtune-owned model-select drop-ins in the roots llmtune can WRITE (/etc
+/// when writable, /run always), plus the filenames of everything else -
+/// foreign drop-ins anywhere, and llmtune drop-ins stuck in read-only roots
+/// (counted as foreign so the staged winning name still out-sorts them).
 /// llmtune-owned model-select drop-ins in the roots llmtune can WRITE (/etc
 /// when writable, /run always), plus the filenames of everything else -
 /// foreign drop-ins anywhere, and llmtune drop-ins stuck in read-only roots
 /// (counted as foreign so the staged winning name still out-sorts them).
 fn collect_dropins(unit: &str) -> (Vec<PathBuf>, Vec<String>) {
-    let install = unit_install_dir();
-    let dirs: Vec<(PathBuf, bool)> = dropin_scan_dirs(unit)
-        .into_iter()
-        .map(|d| {
-            // /run is always writable, even when /etc is the chosen install root.
-            let writable = d.starts_with(install) || d.starts_with(RUN_UNIT_DIR);
-            (d, writable)
-        })
-        .collect();
-    collect_dropins_in(&dirs, |t| t.contains(MARKER))
+	let install = unit_install_dir();
+	let dirs: Vec<(PathBuf, bool)> = dropin_scan_dirs(unit)
+		.into_iter()
+		.map(|d| {
+			// /run is always writable, even when /etc is the chosen install root.
+			let writable = d.starts_with(install) || d.starts_with(RUN_UNIT_DIR);
+			(d, writable)
+		})
+		.collect();
+	collect_dropins_in(&dirs, |t| t.contains(MARKER))
 }
 
 /// Core of [`collect_dropins`] ((dir, writable) pairs injected so tests can
 /// drive it over temp dirs). `is_ours` classifies a drop-in's content as
 /// llmtune-owned (removable) vs foreign.
 fn collect_dropins_in(
-    dirs: &[(PathBuf, bool)],
-    is_ours: impl Fn(&str) -> bool,
+	dirs: &[(PathBuf, bool)],
+	is_ours: impl Fn(&str) -> bool,
 ) -> (Vec<PathBuf>, Vec<String>) {
-    let mut ours = Vec::new();
-    let mut foreign = Vec::new();
-    for (d, writable) in dirs {
-        let (o, mut f) = scan_dropins(d, &is_ours);
-        if *writable {
-            ours.extend(o);
-        } else {
-            foreign.extend(
-                o.iter()
-                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
-            );
-        }
-        foreign.append(&mut f);
-    }
-    (ours, foreign)
+	let mut ours = Vec::new();
+	let mut foreign = Vec::new();
+	for (d, writable) in dirs {
+		let (o, mut f) = scan_dropins(d, &is_ours);
+		if *writable {
+			ours.extend(o);
+		} else {
+			foreign.extend(
+				o.iter()
+					.filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+			);
+		}
+		foreign.append(&mut f);
+	}
+	(ours, foreign)
 }
 
 /// Split a unit's drop-in dir into (llmtune-owned paths, foreign filenames).
@@ -676,22 +854,22 @@ fn collect_dropins_in(
 /// tightens ALL of them, not just the ones with an embedded key - see
 /// `read_dropin`), so classification needs the same privileged read.
 fn scan_dropins(dir: &Path, is_ours: &dyn Fn(&str) -> bool) -> (Vec<PathBuf>, Vec<String>) {
-    let mut ours = Vec::new();
-    let mut foreign = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("conf") {
-                continue;
-            }
-            if is_ours(&read_dropin(&p)) {
-                ours.push(p);
-            } else {
-                foreign.push(e.file_name().to_string_lossy().into_owned());
-            }
-        }
-    }
-    (ours, foreign)
+	let mut ours = Vec::new();
+	let mut foreign = Vec::new();
+	if let Ok(rd) = std::fs::read_dir(dir) {
+		for e in rd.flatten() {
+			let p = e.path();
+			if p.extension().and_then(|x| x.to_str()) != Some("conf") {
+				continue;
+			}
+			if is_ours(&read_dropin(&p)) {
+				ours.push(p);
+			} else {
+				foreign.push(e.file_name().to_string_lossy().into_owned());
+			}
+		}
+	}
+	(ours, foreign)
 }
 
 /// Read a drop-in's content, escalating via `sudo cat` when not already root.
@@ -702,68 +880,109 @@ fn scan_dropins(dir: &Path, is_ours: &dyn Fn(&str) -> bool) -> (Vec<PathBuf>, Ve
 /// foreign, which leaves it un-removed and makes `winning_name` stack another
 /// `z-llmtune` segment on top of it every restage.
 fn read_dropin(path: &Path) -> String {
-    if is_root() {
-        return std::fs::read_to_string(path).unwrap_or_default();
-    }
-    Command::new("sudo")
-        .args(["cat", &path.to_string_lossy()])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
+	if is_root() {
+		return std::fs::read_to_string(path).unwrap_or_default();
+	}
+	Command::new(root_cmd())
+		.args(["cat", &path.to_string_lossy()])
+		.output()
+		.ok()
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.unwrap_or_default()
 }
 
 /// A drop-in filename guaranteed to sort lexicographically AFTER every foreign
 /// drop-in, so llmtune's `ExecStart` wins the systemd merge (last file wins).
 fn winning_name(foreign: &[String]) -> String {
-    let base = "zzzzzz-llmtune.conf".to_string();
-    match foreign.iter().max() {
-        // Append 'z' after the greatest foreign stem: 'z' (0x7A) > '.' (0x2E),
-        // so `<stem>z-llmtune.conf` sorts strictly after `<stem>.conf`.
-        Some(m) if m.as_str() >= base.as_str() => {
-            let stem = m.strip_suffix(".conf").unwrap_or(m);
-            format!("{stem}z-llmtune.conf")
-        }
-        _ => base,
-    }
+	let base = "zzzzzz-llmtune.conf".to_string();
+	match foreign.iter().max() {
+		// Append 'z' after the greatest foreign stem: 'z' (0x7A) > '.' (0x2E),
+		// so `<stem>z-llmtune.conf` sorts strictly after `<stem>.conf`.
+		Some(m) if m.as_str() >= base.as_str() => {
+			let stem = m.strip_suffix(".conf").unwrap_or(m);
+			format!("{stem}z-llmtune.conf")
+		}
+		_ => base,
+	}
 }
 
 /// Whether this process already runs as root (euid 0). The netboot image has
 /// no sudo binary, so privileged ops must run directly there; `setup`/`doctor`
 /// and every `sudo`/`sudo_tee` call share this one detection.
 pub(crate) fn is_root() -> bool {
-    // SAFETY: geteuid can't fail and touches no memory.
-    unsafe { libc::geteuid() == 0 }
+	// SAFETY: geteuid can't fail and touches no memory.
+	unsafe { libc::geteuid() == 0 }
 }
 
 /// The privileged argv: run `args` directly when already root (no sudo on the
 /// netboot image), via `sudo` otherwise. Pure (unit-tested).
 fn privileged_argv<'a>(args: &'a [&'a str], root: bool) -> (&'a str, &'a [&'a str]) {
-    if root {
-        (args[0], &args[1..])
-    } else {
-        ("sudo", args)
-    }
+	if root {
+		(args[0], &args[1..])
+	} else {
+		(root_cmd(), args)
+	}
 }
 
-/// Whether the interactive TUI currently owns the terminal (alternate
-/// screen + raw mode) - set for `ui::run()`'s lifetime. `sudo()` reads this
-/// to decide whether an interactive password prompt is safe to attempt: a
-/// prompt writes straight to `/dev/tty`, bypassing stdout/stderr capture
-/// entirely (sudo does this BY DESIGN, so redirecting a command's stdio
-/// can't hide or swallow the prompt) - while the TUI has that same tty in
-/// alternate-screen/raw mode, the prompt lands wherever ratatui last drew
-/// that screen region instead of a usable prompt, and the TUI's own event
-/// loop (not a shell) owns keyboard input, so there is no way to type an
-/// answer (reported live in aibc250, Scent, 2026-09-14).
+/// Either `sudo` or `doas` - detected once at startup.
+#[derive(Clone, Copy)]
+enum RootMethod {
+	Sudo,
+	Doas,
+}
+
+/// Thread-safe singleton: detected root-elevation method.
+static ROOT_METHOD: std::sync::OnceLock<RootMethod> = std::sync::OnceLock::new();
+
+/// Initialize root method at first use.
+fn init_root_method() {
+	let method = detect_root_method();
+	ROOT_METHOD.get_or_init(|| method);
+}
+
+/// Detect whether `doas` or `sudo` is available on PATH.
+fn detect_root_method() -> RootMethod {
+	// doas silently exits 0 with no stdout on -h
+	let has_doas = Command::new("doas")
+		.args(["-h"])
+		.output()
+		.map(|o| o.stdout.is_empty())
+		.ok();
+
+	// sudo silently exits 0 (but doesn't run the command) on -n
+	let has_sudo = Command::new("sudo")
+		.args(["-n", "true"])
+		.output()
+		.map(|o| o.status.success())
+		.ok();
+
+	if has_doas.unwrap_or(false) {
+		RootMethod::Doas
+	} else if has_sudo.unwrap_or(false) {
+		RootMethod::Sudo
+	} else {
+		RootMethod::Sudo
+	}
+}
+
+/// Return the root-elevation binary detected at startup.
+fn root_cmd() -> &'static str {
+	init_root_method();
+	match ROOT_METHOD.get().copied() {
+		Some(RootMethod::Sudo) => "sudo",
+		Some(RootMethod::Doas) => "doas",
+		None => "sudo",
+	}
+}
+
 static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn set_tui_active(active: bool) {
-    TUI_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+	TUI_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn tui_active() -> bool {
-    TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+	TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// True when `sudo` should never be allowed to prompt on THIS call: the TUI
@@ -778,7 +997,7 @@ fn tui_active() -> bool {
 /// through. `-n` on the one call sudo actually runs makes a prompt
 /// impossible regardless of timing.
 fn must_be_noninteractive(tui_active: bool) -> bool {
-    tui_active
+	tui_active
 }
 
 /// Run a privileged command: directly when already root, via sudo otherwise.
@@ -799,28 +1018,28 @@ fn must_be_noninteractive(tui_active: bool) -> bool {
 /// with a message that says a password is needed, instead of writing an
 /// unusable prompt onto the TUI's screen.
 pub(crate) fn sudo(args: &[&str]) -> Result<()> {
-    if args.is_empty() {
-        bail!("privileged exec called with an empty argv");
-    }
-    let (prog, rest) = privileged_argv(args, is_root());
-    let noninteractive = prog == "sudo" && must_be_noninteractive(tui_active());
-    let mut cmd = Command::new(prog);
-    if noninteractive {
-        cmd.arg("-n");
-    }
-    let out = cmd.args(rest).output()?;
-    if !out.status.success() {
-        if noninteractive {
-            bail!(
-                "this needs a sudo password, but the interactive TUI can't safely prompt for one \
-                 (the prompt would write straight to the terminal ratatui is drawing to, with no \
-                 way to type an answer) - run `sudo -v` in another terminal first (caches it for a \
-                 while), or add a NOPASSWD sudoers rule for llmtune's systemctl calls, then retry"
-            );
-        }
-        bail!(sudo_failure_message(prog, rest, out.status, &out.stderr));
-    }
-    Ok(())
+	if args.is_empty() {
+		bail!("privileged exec called with an empty argv");
+	}
+	let (prog, rest) = privileged_argv(args, is_root());
+	let noninteractive = !is_root() && must_be_noninteractive(tui_active());
+	let mut cmd = Command::new(prog);
+	if noninteractive {
+		cmd.arg("-n");
+	}
+	let out = cmd.args(rest).output()?;
+	if !out.status.success() {
+		if noninteractive {
+			bail!(
+				"this needs a sudo password, but the interactive TUI can't safely prompt for one \
+				 (the prompt would write straight to the terminal ratatui is drawing to, with no \
+				 way to type an answer) - run `sudo -v` in another terminal first (caches it for a \
+				 while), or add a NOPASSWD sudoers rule for llmtune's systemctl calls, then retry"
+			);
+		}
+		bail!(sudo_failure_message(prog, rest, out.status, &out.stderr));
+	}
+	Ok(())
 }
 
 /// Pure formatter for a failed privileged command - separated from `sudo` so
@@ -828,30 +1047,63 @@ pub(crate) fn sudo(args: &[&str]) -> Result<()> {
 /// bare exit status when stderr is empty/non-UTF8 (some failures, e.g. sudo
 /// itself refusing, print nothing there).
 fn sudo_failure_message(
-    prog: &str,
-    rest: &[&str],
-    status: std::process::ExitStatus,
-    stderr: &[u8],
+	prog: &str,
+	rest: &[&str],
+	status: std::process::ExitStatus,
+	stderr: &[u8],
 ) -> String {
-    let msg = String::from_utf8_lossy(stderr);
-    let msg = msg.trim();
-    if msg.is_empty() {
-        format!("{prog} {rest:?} failed ({status})")
-    } else {
-        format!("{prog} {rest:?} failed ({status}): {msg}")
-    }
+	let msg = String::from_utf8_lossy(stderr);
+	let msg = msg.trim();
+	if msg.is_empty() {
+		format!("{prog} {rest:?} failed ({status})")
+	} else {
+		format!("{prog} {rest:?} failed ({status}): {msg}")
+	}
+}
+
+/// The user a unit runs as. For systemd units this is the `User=` directive;
+/// for OpenRC units it is `RC_USER` from the `/etc/conf.d/<unit>` file.
+fn unit_user(unit: &str) -> String {
+	if is_systemd() {
+		unit_user_systemd(unit)
+	} else {
+		openrc_unit_user(unit)
+	}
 }
 
 /// The user a systemd unit runs as (`User=`), or "root" if unset/unknown.
-fn unit_user(unit: &str) -> String {
-    Command::new("systemctl")
-        .args(["show", "-p", "User", "--value", unit])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "root".to_string())
+fn unit_user_systemd(unit: &str) -> String {
+	Command::new("systemctl")
+		.args(["show", "-p", "User", "--value", unit])
+		.output()
+		.ok()
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+		.unwrap_or_else(|| "root".to_string())
+}
+
+/// The user an OpenRC unit runs as, or "root" if unset/unknown.
+/// Reads `/etc/conf.d/<unit>` and extracts `RC_USER=...`.
+fn openrc_unit_user(unit: &str) -> String {
+	let conf = PathBuf::from(format!("/etc/conf.d/{unit}"));
+	let content = if is_root() {
+		std::fs::read_to_string(&conf).unwrap_or_default()
+	} else {
+		Command::new(root_cmd())
+			.args(["cat", &conf.to_string_lossy()])
+			.output()
+			.ok()
+			.and_then(|o| String::from_utf8(o.stdout).ok())
+			.unwrap_or_default()
+	};
+	content
+		.lines()
+		.find(|l| l.starts_with("RC_USER="))
+		.and_then(|l| l.strip_prefix("RC_USER="))
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+		.unwrap_or_else(|| "root".to_string())
 }
 
 /// Write `key` to a 0600 file owned by the unit's service user and return its
@@ -860,43 +1112,43 @@ fn unit_user(unit: &str) -> String {
 /// 0600 (created that way, no world-readable window), and it is chowned to the
 /// user llama-server runs as so it can read it. Returns the path.
 pub(crate) fn write_api_key_file(unit: &str, key: &str) -> Result<String> {
-    let path = crate::paths::shared_state_dir().join("api-key");
-    let path_s = path.to_string_lossy().to_string();
-    let user = unit_user(unit);
-    if let Some(parent) = path.parent() {
-        sudo(&["mkdir", "-p", &parent.to_string_lossy()])?;
-    }
-    // 0600 root-owned, key piped via stdin (sudo_tee_secret), then hand it to the
-    // service user so the launched llama-server can read it.
-    sudo_tee_secret(&path, key)?;
-    sudo(&["chown", "--", &user, &path_s])?;
-    Ok(path_s)
+	let path = crate::paths::shared_state_dir().join("api-key");
+	let path_s = path.to_string_lossy().to_string();
+	let user = unit_user(unit);
+	if let Some(parent) = path.parent() {
+		sudo(&["mkdir", "-p", &parent.to_string_lossy()])?;
+	}
+	// 0600 root-owned, key piped via stdin (sudo_tee_secret), then hand it to the
+	// service user so the launched llama-server can read it.
+	sudo_tee_secret(&path, key)?;
+	sudo(&["chown", "--", &user, &path_s])?;
+	Ok(path_s)
 }
 
 pub(crate) fn sudo_tee(path: &Path, content: &str) -> Result<()> {
-    // Same root detection as `sudo`: run `tee` directly when already root.
-    let mut cmd = if is_root() {
-        Command::new("tee")
-    } else {
-        let mut c = Command::new("sudo");
-        c.arg("tee");
-        c
-    };
-    let mut child = cmd
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(content.as_bytes())?;
-    let st = child.wait()?;
-    if !st.success() {
-        bail!("tee {} failed ({st})", path.display());
-    }
-    Ok(())
+	// Same root detection as `sudo`: run `tee` directly when already root.
+	let mut cmd = if is_root() {
+		Command::new("tee")
+	} else {
+		let mut c = Command::new(root_cmd());
+		c.arg("tee");
+		c
+	};
+	let mut child = cmd
+		.arg(path)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::null())
+		.spawn()?;
+	child
+		.stdin
+		.take()
+		.expect("stdin piped")
+		.write_all(content.as_bytes())?;
+	let st = child.wait()?;
+	if !st.success() {
+		bail!("tee {} failed ({st})", path.display());
+	}
+	Ok(())
 }
 
 /// `sudo_tee` then tighten the file to owner-only (0600). The drop-in and its
@@ -904,12 +1156,12 @@ pub(crate) fn sudo_tee(path: &Path, content: &str) -> Result<()> {
 /// (root umask), so any local user could read the key. systemd reads drop-ins as
 /// root, so 0600 does not affect it.
 pub(crate) fn sudo_tee_secret(path: &Path, content: &str) -> Result<()> {
-    // Pre-create the file 0600 (tee truncates+writes but never widens the mode),
-    // so the api-key-bearing drop-in is never world-readable for a window between
-    // a `tee` and a follow-up `chmod`. The path is always an absolute,
-    // llmtune-constructed drop-in/backup path (no leading '-').
-    sudo(&["install", "-m", "600", "/dev/null", &path.to_string_lossy()])?;
-    sudo_tee(path, content)
+	// Pre-create the file 0600 (tee truncates+writes but never widens the mode),
+	// so the api-key-bearing drop-in is never world-readable for a window between
+	// a `tee` and a follow-up `chmod`. The path is always an absolute,
+	// llmtune-constructed drop-in/backup path (no leading '-').
+	sudo(&["install", "-m", "600", "/dev/null", &path.to_string_lossy()])?;
+	sudo_tee(path, content)
 }
 
 /// Actuator that drives a real systemd-managed llama-server via a drop-in. It
@@ -917,644 +1169,713 @@ pub(crate) fn sudo_tee_secret(path: &Path, content: &str) -> Result<()> {
 /// competing drop-in, e.g. another model-manager's), removing stale llmtune
 /// drop-ins first and restoring them on rollback.
 pub struct SystemdActuator {
-    /// The drop-in we wrote this stage (removed on rollback).
-    wrote: Option<PathBuf>,
-    /// A prior llmtune drop-in we removed (path, content), restored on rollback.
-    removed_self: Option<(PathBuf, String)>,
-    backup_dir: PathBuf,
+	/// The drop-in we wrote this stage (removed on rollback).
+	wrote: Option<PathBuf>,
+	/// A prior llmtune drop-in we removed (path, content), restored on rollback.
+	removed_self: Option<(PathBuf, String)>,
+	backup_dir: PathBuf,
 }
 
 impl SystemdActuator {
-    pub fn new() -> Self {
-        SystemdActuator {
-            wrote: None,
-            removed_self: None,
-            backup_dir: PathBuf::from("/var/lib/llmtune/backups"),
-        }
-    }
+	pub fn new() -> Self {
+		SystemdActuator {
+			wrote: None,
+			removed_self: None,
+			backup_dir: PathBuf::from("/var/lib/llmtune/backups"),
+		}
+	}
 }
 
 impl Default for SystemdActuator {
-    fn default() -> Self {
-        Self::new()
-    }
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl Actuator for SystemdActuator {
-    fn stage(&mut self, unit: &str, dropin: &str) -> Result<()> {
-        let dir = dropin_dir(unit);
-        // Union scan across ALL drop-in roots: stale llmtune drop-ins in any
-        // writable root are removed, and foreign names from every root feed
-        // winning_name() - so the staged file can't be shadowed by an override
-        // in another root (e.g. the netboot image's bc250-swap conf in /run).
-        let (ours, foreign) = collect_dropins(unit);
-        // Remove any existing llmtune drop-ins; back up the first to restore on rollback.
-        for (i, p) in ours.iter().enumerate() {
-            if i == 0 {
-                let content = read_dropin(p);
-                let _ = sudo(&["mkdir", "-p", &self.backup_dir.to_string_lossy()]);
-                let _ = sudo_tee_secret(
-                    &self.backup_dir.join(format!("{unit}.dropin.prev")),
-                    &content,
-                );
-                self.removed_self = Some((p.clone(), content));
-            }
-            let _ = sudo(&["rm", "-f", &p.to_string_lossy()]);
-        }
-        let path = dir.join(winning_name(&foreign));
-        sudo(&["mkdir", "-p", &dir.to_string_lossy()])?;
-        sudo_tee_secret(&path, dropin)?;
-        self.wrote = Some(path);
-        Ok(())
-    }
+	fn stage(&mut self, unit: &str, dropin: &str) -> Result<()> {
+		let dir = dropin_dir(unit);
+		// Union scan across ALL drop-in roots: stale llmtune drop-ins in any
+		// writable root are removed, and foreign names from every root feed
+		// winning_name() - so the staged file can't be shadowed by an override
+		// in another root (e.g. the netboot image's bc250-swap conf in /run).
+		let (ours, foreign) = collect_dropins(unit);
+		// Remove any existing llmtune drop-ins; back up the first to restore on rollback.
+		for (i, p) in ours.iter().enumerate() {
+			if i == 0 {
+				let content = read_dropin(p);
+				let _ = sudo(&["mkdir", "-p", &self.backup_dir.to_string_lossy()]);
+				let _ = sudo_tee_secret(
+					&self.backup_dir.join(format!("{unit}.dropin.prev")),
+					&content,
+				);
+				self.removed_self = Some((p.clone(), content));
+			}
+			let _ = sudo(&["rm", "-f", &p.to_string_lossy()]);
+		}
+		let path = dir.join(winning_name(&foreign));
+		sudo(&["mkdir", "-p", &dir.to_string_lossy()])?;
+		sudo_tee_secret(&path, dropin)?;
+		self.wrote = Some(path);
+		Ok(())
+	}
 
-    fn rollback(&mut self, _unit: &str) -> Result<()> {
-        if let Some(p) = self.wrote.take() {
-            sudo(&["rm", "-f", &p.to_string_lossy()])?;
-        }
-        if let Some((p, c)) = self.removed_self.take() {
-            sudo_tee_secret(&p, &c)?;
-        }
-        Ok(())
-    }
+	fn rollback(&mut self, _unit: &str) -> Result<()> {
+		if let Some(p) = self.wrote.take() {
+			sudo(&["rm", "-f", &p.to_string_lossy()])?;
+		}
+		if let Some((p, c)) = self.removed_self.take() {
+			sudo_tee_secret(&p, &c)?;
+		}
+		Ok(())
+	}
 
-    fn commit(&mut self) -> Result<()> {
-        // Keep our drop-in; the removed foreign-vs-self state is now permanent.
-        self.removed_self = None;
-        Ok(())
-    }
+	fn commit(&mut self) -> Result<()> {
+		// Keep our drop-in; the removed foreign-vs-self state is now permanent.
+		self.removed_self = None;
+		Ok(())
+	}
 
-    fn reload_restart(&mut self, unit: &str) -> Result<()> {
-        sudo(&["systemctl", "daemon-reload"])?;
-        // Clear any latched start-limit BEFORE restarting. Without this, a prior
-        // crash-loop that tripped the guard (4 fails/120s) leaves the unit in a
-        // start-limit-hit state where `systemctl restart` is REFUSED - so the
-        // auto-revert below would fail to bring the previous good model back and
-        // the box would sit with nothing served until a human ran reset-failed.
-        // reset-failed on a healthy unit is a harmless no-op.
-        let _ = sudo(&["systemctl", "reset-failed", unit]);
-        sudo(&["systemctl", "restart", unit])?;
-        Ok(())
-    }
+	fn reload_restart(&mut self, unit: &str) -> Result<()> {
+		sudo(&["systemctl", "daemon-reload"])?;
+		// Clear any latched start-limit BEFORE restarting. Without this, a prior
+		// crash-loop that tripped the guard (4 fails/120s) leaves the unit in a
+		// start-limit-hit state where `systemctl restart` is REFUSED - so the
+		// auto-revert below would fail to bring the previous good model back and
+		// the box would sit with nothing served until a human ran reset-failed.
+		// reset-failed on a healthy unit is a harmless no-op.
+		let _ = sudo(&["systemctl", "reset-failed", unit]);
+		sudo(&["systemctl", "restart", unit])?;
+		Ok(())
+	}
+}
+
+/// Actuator that drives a real OpenRC-managed llama-server via `/etc/conf.d/`.
+/// Writes the conf file and uses `rc-service` to restart.
+pub struct OpenrcActuator {
+	/// The conf file content we wrote this stage (restored on rollback).
+	wrote: Option<String>,
+	/// Previous content of `/etc/conf.d/llama-server`, restored on rollback.
+	prev: Option<String>,
+}
+
+impl OpenrcActuator {
+	pub fn new() -> Self {
+		OpenrcActuator {
+			wrote: None,
+			prev: None,
+		}
+	}
+}
+
+impl Default for OpenrcActuator {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Actuator for OpenrcActuator {
+	fn stage(&mut self, unit: &str, dropin: &str) -> Result<()> {
+		let conf = PathBuf::from(format!("/etc/conf.d/{unit}"));
+		// Read previous content for rollback.
+		self.prev = if is_root() {
+			std::fs::read_to_string(&conf).ok()
+		} else {
+			Command::new(root_cmd())
+				.args(["cat", &conf.to_string_lossy()])
+				.output()
+				.ok()
+				.and_then(|o| String::from_utf8(o.stdout).ok())
+		};
+		self.wrote = Some(dropin.to_string());
+		sudo_tee_secret(&conf, dropin)
+	}
+
+	fn rollback(&mut self, _unit: &str) -> Result<()> {
+		if let Some(prev) = self.prev.take() {
+			let p = PathBuf::from("/etc/conf.d/llama-server");
+			sudo_tee_secret(&p, &prev)?;
+		}
+		Ok(())
+	}
+
+	fn commit(&mut self) -> Result<()> {
+		// Keep our conf file; prev is dropped.
+		Ok(())
+	}
+
+	fn reload_restart(&mut self, unit: &str) -> Result<()> {
+		sudo(&["rc-service", unit, "restart"])?;
+		Ok(())
+	}
 }
 
 /// Health probe backed by a live llama-server HTTP endpoint.
 pub struct HttpHealth {
-    pub url: String,
+	pub url: String,
 }
 
 impl Health for HttpHealth {
-    fn healthy(&self) -> bool {
-        llama::health_ok(&self.url)
-    }
-    fn served(&self) -> Option<String> {
-        llama::served_name(&self.url)
-    }
-    fn warm(&self) {
-        llama::warm(&self.url, &[8, 64, 256]);
-    }
+	fn healthy(&self) -> bool {
+		llama::health_ok(&self.url)
+	}
+	fn served(&self) -> Option<String> {
+		llama::served_name(&self.url)
+	}
+	fn warm(&self) {
+		llama::warm(&self.url, &[8, 64, 256]);
+	}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::profile;
-    use std::cell::{Cell, RefCell};
+	use super::*;
+	use crate::profile;
+	use std::cell::{Cell, RefCell};
 
-    fn model(name: &str, arch: &str, size: u64) -> Model {
-        model_mtp(name, arch, size, true)
-    }
+	fn model(name: &str, arch: &str, size: u64) -> Model {
+		model_mtp(name, arch, size, true)
+	}
 
-    fn model_mtp(name: &str, arch: &str, size: u64, has_mtp: bool) -> Model {
-        Model {
-            path: PathBuf::from(format!("/models/{name}")),
-            name: name.to_string(),
-            arch: arch.to_string(),
-            params: None,
-            quant: None,
-            size_bytes: size,
-            ctx_max: None,
-            has_mtp,
-        }
-    }
+	fn model_mtp(name: &str, arch: &str, size: u64, has_mtp: bool) -> Model {
+		Model {
+			path: PathBuf::from(format!("/models/{name}")),
+			name: name.to_string(),
+			arch: arch.to_string(),
+			params: None,
+			quant: None,
+			size_bytes: size,
+			ctx_max: None,
+			has_mtp,
+		}
+	}
 
-    fn a_profile(id: &str) -> Profile {
-        let ps = profile::load().unwrap();
-        let mut p = ps.into_iter().find(|p| p.id == id).unwrap();
-        // Seed profiles reference a managed build; for swap-flow tests give a
-        // literal resolved binary so launch() yields a real path (not the bare
-        // name the not-installed-build fail-fast now rejects).
-        p.build = None;
-        p.bin = "/opt/llama/llama-server".into();
-        p
-    }
+	fn a_profile(id: &str) -> Profile {
+		let ps = profile::load().unwrap();
+		let mut p = ps.into_iter().find(|p| p.id == id).unwrap();
+		// Seed profiles reference a managed build; for swap-flow tests give a
+		// literal resolved binary so launch() yields a real path (not the bare
+		// name the not-installed-build fail-fast now rejects).
+		p.build = None;
+		p.bin = "/opt/llama/llama-server".into();
+		p
+	}
 
-    #[test]
-    fn dropin_render_snapshot() {
-        let p = a_profile("qwen35moe");
-        let m = model("Q.gguf", "qwen35moe", 12_000_000_000);
-        let flags = adjust_flags(&p, &m);
-        // render_dropin takes the RESOLVED bin/ld (the caller resolves a managed
-        // build); pass explicit values so the render stays a pure snapshot.
-        let out = render_dropin(
-            &p,
-            "/opt/llama/llama-server",
-            Some("/opt/llama"),
-            &flags,
-            Path::new("/models/Q.gguf"),
-            "127.0.0.1",
-            8080,
-            &BTreeMap::new(),
-        );
-        assert!(out.contains("[Service]"));
-        // clean-takeover: the env reset precedes our own Environment= lines.
-        let reset = out.find("Environment=\n").expect("env reset line present");
-        let ld = out.find("Environment=LD_LIBRARY_PATH=").expect("ld set");
-        assert!(reset < ld, "reset must come before our env assignments");
-        assert!(out.contains("Environment=LD_LIBRARY_PATH=/opt/llama"));
-        assert!(out.contains("Environment=GGML_VK_PREFER_HOST_MEMORY=1"));
-        // bin + model path are quoted (space-safe); flags stay unquoted.
-        assert!(out.contains("ExecStart=\nExecStart=stdbuf -oL -eL \"/opt/llama/llama-server\" -m \"/models/Q.gguf\" --host 127.0.0.1 --port 8080 "));
-        // cwd is the model's own directory, so a bare-filename companion flag
-        // (--mmproj etc) resolves the same way it would run by hand.
-        assert!(out.contains("WorkingDirectory=/models\n"));
-        // MTP is upstream now, via the `--spec-type` framework (the bare `--mtp`
-        // from the initial merge was folded into `--spec-type draft-mtp` by #23269;
-        // verified on a BC-250 - current upstream rejects `--mtp`).
-        assert!(out.contains("--spec-type draft-mtp"));
-        assert!(out.contains("--spec-draft-n-max 1"));
-    }
+	#[test]
+	fn dropin_render_snapshot() {
+		let p = a_profile("qwen35moe");
+		let m = model("Q.gguf", "qwen35moe", 12_000_000_000);
+		let flags = adjust_flags(&p, &m);
+		// render_dropin takes the RESOLVED bin/ld (the caller resolves a managed
+		// build); pass explicit values so the render stays a pure snapshot.
+		let out = render_dropin(
+			&p,
+			"/opt/llama/llama-server",
+			Some("/opt/llama"),
+			&flags,
+			Path::new("/models/Q.gguf"),
+			"127.0.0.1",
+			8080,
+			&BTreeMap::new(),
+			DropinFormat::Systemd,
+		);
+		assert!(out.contains("[Service]"));
+		// clean-takeover: the env reset precedes our own Environment= lines.
+		let reset = out.find("Environment=\n").expect("env reset line present");
+		let ld = out.find("Environment=LD_LIBRARY_PATH=").expect("ld set");
+		assert!(reset < ld, "reset must come before our env assignments");
+		assert!(out.contains("Environment=LD_LIBRARY_PATH=/opt/llama"));
+		assert!(out.contains("Environment=GGML_VK_PREFER_HOST_MEMORY=1"));
+		// bin + model path are quoted (space-safe); flags stay unquoted.
+		assert!(out.contains("ExecStart=\nExecStart=stdbuf -oL -eL \"/opt/llama/llama-server\" -m \"/models/Q.gguf\" --host 127.0.0.1 --port 8080 "));
+		// cwd is the model's own directory, so a bare-filename companion flag
+		// (--mmproj etc) resolves the same way it would run by hand.
+		assert!(out.contains("WorkingDirectory=/models\n"));
+		// MTP is upstream now, via the `--spec-type` framework (the bare `--mtp`
+		// from the initial merge was folded into `--spec-type draft-mtp` by #23269;
+		// verified on a BC-250 - current upstream rejects `--mtp`).
+		assert!(out.contains("--spec-type draft-mtp"));
+		assert!(out.contains("--spec-draft-n-max 1"));
+	}
 
-    #[test]
-    fn adjust_flags_keeps_mtp_when_model_has_it() {
-        let p = a_profile("qwen35");
-        let m = model_mtp("Q.gguf", "qwen35", 6_000_000_000, true);
-        let flags = adjust_flags(&p, &m);
-        assert!(flags.contains("--spec-type draft-mtp"));
-        assert!(flags.contains("--spec-draft-n-max 1"));
-    }
+	#[test]
+	fn adjust_flags_keeps_mtp_when_model_has_it() {
+		let p = a_profile("qwen35");
+		let m = model_mtp("Q.gguf", "qwen35", 6_000_000_000, true);
+		let flags = adjust_flags(&p, &m);
+		assert!(flags.contains("--spec-type draft-mtp"));
+		assert!(flags.contains("--spec-draft-n-max 1"));
+	}
 
-    #[test]
-    fn adjust_flags_strips_mtp_when_model_lacks_it() {
-        // A qwen35 fine-tune/distill without MTP layers must not carry
-        // --spec-type draft-mtp (llama-server aborts on load otherwise).
-        let p = a_profile("qwen35");
-        let m = model_mtp("Distill.gguf", "qwen35", 6_000_000_000, false);
-        let flags = adjust_flags(&p, &m);
-        assert!(
-            !flags.contains("--spec-type"),
-            "spec-type must be stripped: {flags}"
-        );
-        assert!(
-            !flags.contains("--spec-draft"),
-            "spec-draft flags must be stripped: {flags}"
-        );
-        // the rest of the profile survives
-        assert!(flags.contains("--flash-attn on"));
-        assert!(flags.contains("-ngl 99"));
-    }
+	#[test]
+	fn adjust_flags_strips_mtp_when_model_lacks_it() {
+		// A qwen35 fine-tune/distill without MTP layers must not carry
+		// --spec-type draft-mtp (llama-server aborts on load otherwise).
+		let p = a_profile("qwen35");
+		let m = model_mtp("Distill.gguf", "qwen35", 6_000_000_000, false);
+		let flags = adjust_flags(&p, &m);
+		assert!(
+			!flags.contains("--spec-type"),
+			"spec-type must be stripped: {flags}"
+		);
+		assert!(
+			!flags.contains("--spec-draft"),
+			"spec-draft flags must be stripped: {flags}"
+		);
+		// the rest of the profile survives
+		assert!(flags.contains("--flash-attn on"));
+		assert!(flags.contains("-ngl 99"));
+	}
 
-    #[test]
-    fn strip_mtp_flags_removes_flag_and_value() {
-        let got = strip_mtp_flags(
-            "-c 32768 --spec-type draft-mtp --spec-draft-n-max 1 --flash-attn on -ngl 99",
-        );
-        assert_eq!(got, "-c 32768 --flash-attn on -ngl 99");
-    }
+	#[test]
+	fn strip_mtp_flags_removes_flag_and_value() {
+		let got = strip_mtp_flags(
+			"-c 32768 --spec-type draft-mtp --spec-draft-n-max 1 --flash-attn on -ngl 99",
+		);
+		assert_eq!(got, "-c 32768 --flash-attn on -ngl 99");
+	}
 
-    #[test]
-    fn dropin_quotes_paths_with_spaces() {
-        let p = a_profile("_default");
-        let out = render_dropin(
-            &p,
-            "/opt/llama/llama-server",
-            None,
-            "-c 4096",
-            Path::new("/models/My Big Model.gguf"),
-            "127.0.0.1",
-            8080,
-            &BTreeMap::new(),
-        );
-        // the model path must survive as a single quoted argument
-        assert!(out.contains("-m \"/models/My Big Model.gguf\""));
-    }
+	#[test]
+	fn dropin_quotes_paths_with_spaces() {
+		let p = a_profile("_default");
+		let out = render_dropin(
+			&p,
+			"/opt/llama/llama-server",
+			None,
+			"-c 4096",
+			Path::new("/models/My Big Model.gguf"),
+			"127.0.0.1",
+			8080,
+			&BTreeMap::new(),
+			DropinFormat::Systemd,
+		);
+		// the model path must survive as a single quoted argument
+		assert!(out.contains("-m \"/models/My Big Model.gguf\""));
+	}
 
-    #[test]
-    fn dropin_forces_line_buffering_for_journald() {
-        // llama-server (like most C/C++ stdio) fully block-buffers its
-        // console log once stdout isn't a real terminal (systemd's journald
-        // capture) - `node logs`/`journalctl -f` would then show the same
-        // lines batched and delayed instead of live, unlike running it by
-        // hand. Reported live in aibc250 (Scent, 2026-09-15).
-        let p = a_profile("_default");
-        let out = render_dropin(
-            &p,
-            "/opt/llama/llama-server",
-            None,
-            "-c 4096",
-            Path::new("/models/Q.gguf"),
-            "127.0.0.1",
-            8080,
-            &BTreeMap::new(),
-        );
-        assert!(
-            out.contains("ExecStart=stdbuf -oL -eL \"/opt/llama/llama-server\""),
-            "stdbuf forces line buffering ahead of the real binary: {out}"
-        );
-    }
+	#[test]
+	fn dropin_forces_line_buffering_for_journald() {
+		// llama-server (like most C/C++ stdio) fully block-buffers its
+		// console log once stdout isn't a real terminal (systemd's journald
+		// capture) - `node logs`/`journalctl -f` would then show the same
+		// lines batched and delayed instead of live, unlike running it by
+		// hand. Reported live in aibc250 (Scent, 2026-09-15).
+		let p = a_profile("_default");
+		let out = render_dropin(
+			&p,
+			"/opt/llama/llama-server",
+			None,
+			"-c 4096",
+			Path::new("/models/Q.gguf"),
+			"127.0.0.1",
+			8080,
+			&BTreeMap::new(),
+			DropinFormat::Systemd,
+		);
+		assert!(
+			out.contains("ExecStart=stdbuf -oL -eL \"/opt/llama/llama-server\""),
+			"stdbuf forces line buffering ahead of the real binary: {out}"
+		);
+	}
 
-    #[test]
-    fn dropin_sets_working_directory_to_the_models_dir() {
-        // A bare-filename companion flag (`--mmproj foo.gguf`, as the user
-        // typed it running llama-server by hand from inside the models dir)
-        // must resolve the same way under systemd - reported live in aibc250
-        // (Scent, 2026-09-14): it silently failed to start without this.
-        let p = a_profile("_default");
-        let out = render_dropin(
-            &p,
-            "/opt/llama/llama-server",
-            None,
-            "--mmproj mmproj-Q8_0.gguf",
-            Path::new("/var/lib/llmtune/models/Model.gguf"),
-            "127.0.0.1",
-            8080,
-            &BTreeMap::new(),
-        );
-        assert!(out.contains("WorkingDirectory=/var/lib/llmtune/models\n"));
-    }
+	#[test]
+	fn dropin_sets_working_directory_to_the_models_dir() {
+		// A bare-filename companion flag (`--mmproj foo.gguf`, as the user
+		// typed it running llama-server by hand from inside the models dir)
+		// must resolve the same way under systemd - reported live in aibc250
+		// (Scent, 2026-09-14): it silently failed to start without this.
+		let p = a_profile("_default");
+		let out = render_dropin(
+			&p,
+			"/opt/llama/llama-server",
+			None,
+			"--mmproj mmproj-Q8_0.gguf",
+			Path::new("/var/lib/llmtune/models/Model.gguf"),
+			"127.0.0.1",
+			8080,
+			&BTreeMap::new(),
+			DropinFormat::Systemd,
+		);
+		assert!(out.contains("WorkingDirectory=/var/lib/llmtune/models\n"));
+	}
 
-    #[test]
-    fn launch_resolves_literal_bin_when_no_build() {
-        // A profile without `build` returns its literal bin/ld unchanged.
-        let mut p = a_profile("_default");
-        p.build = None;
-        p.bin = "/custom/llama-server".into();
-        p.ld_path = Some("/custom/lib".into());
-        let (bin, ld) = p.launch();
-        assert_eq!(bin, "/custom/llama-server");
-        assert_eq!(ld.as_deref(), Some("/custom/lib"));
-    }
+	#[test]
+	fn launch_resolves_literal_bin_when_no_build() {
+		// A profile without `build` returns its literal bin/ld unchanged.
+		let mut p = a_profile("_default");
+		p.build = None;
+		p.bin = "/custom/llama-server".into();
+		p.ld_path = Some("/custom/lib".into());
+		let (bin, ld) = p.launch();
+		assert_eq!(bin, "/custom/llama-server");
+		assert_eq!(ld.as_deref(), Some("/custom/lib"));
+	}
 
-    #[test]
-    fn launch_falls_back_to_bare_name_when_build_absent() {
-        // `build` set but not installed -> bare binary name (a visible failure
-        // signal: not an absolute path), never a stale guess.
-        let mut p = a_profile("_default");
-        p.build = Some("definitely-not-installed".into());
-        p.bin = "llama-server".into();
-        let (bin, _ld) = p.launch();
-        assert_eq!(bin, "llama-server");
-        assert!(!std::path::Path::new(&bin).is_absolute());
-    }
+	#[test]
+	fn launch_falls_back_to_bare_name_when_build_absent() {
+		// `build` set but not installed -> bare binary name (a visible failure
+		// signal: not an absolute path), never a stale guess.
+		let mut p = a_profile("_default");
+		p.build = Some("definitely-not-installed".into());
+		p.bin = "llama-server".into();
+		let (bin, _ld) = p.launch();
+		assert_eq!(bin, "llama-server");
+		assert!(!std::path::Path::new(&bin).is_absolute());
+	}
 
-    #[test]
-    fn memory_guard_shrinks_dense_qwen35() {
-        let p = a_profile("qwen35");
-        // dense qwen35 >9GB -> 98304 shrinks to 32768
-        let big = model("Qwen3.5-9B-Q8.gguf", "qwen35", 9_800_000_000);
-        assert!(adjust_flags(&p, &big).contains("-c 32768"));
-        assert!(!adjust_flags(&p, &big).contains("-c 98304"));
-        // a lighter dense qwen35 keeps the big window
-        let small = model("Qwen3.5-9B-Q4.gguf", "qwen35", 6_500_000_000);
-        assert!(adjust_flags(&p, &small).contains("-c 98304"));
-    }
+	#[test]
+	fn memory_guard_shrinks_dense_qwen35() {
+		let p = a_profile("qwen35");
+		// dense qwen35 >9GB -> 98304 shrinks to 32768
+		let big = model("Qwen3.5-9B-Q8.gguf", "qwen35", 9_800_000_000);
+		assert!(adjust_flags(&p, &big).contains("-c 32768"));
+		assert!(!adjust_flags(&p, &big).contains("-c 98304"));
+		// a lighter dense qwen35 keeps the big window
+		let small = model("Qwen3.5-9B-Q4.gguf", "qwen35", 6_500_000_000);
+		assert!(adjust_flags(&p, &small).contains("-c 98304"));
+	}
 
-    #[test]
-    fn memory_guard_leaves_moe_alone() {
-        let p = a_profile("qwen35moe");
-        let m = model("Qwen3.6-35B-A3B.gguf", "qwen35moe", 12_000_000_000);
-        // moe profile is already -c 32768; guard must not touch it (no 98304 present)
-        assert_eq!(adjust_flags(&p, &m), p.flags);
-    }
+	#[test]
+	fn memory_guard_leaves_moe_alone() {
+		let p = a_profile("qwen35moe");
+		let m = model("Qwen3.6-35B-A3B.gguf", "qwen35moe", 12_000_000_000);
+		// moe profile is already -c 32768; guard must not touch it (no 98304 present)
+		assert_eq!(adjust_flags(&p, &m), p.flags);
+	}
 
-    // ---- mock-driven orchestration tests ----
+	// ---- mock-driven orchestration tests ----
 
-    struct MockActuator {
-        log: RefCell<Vec<String>>,
-        committed: Cell<bool>,
-        rolled_back: Cell<bool>,
-        /// Fail the FIRST reload_restart (the staged one); the revert reload still
-        /// succeeds, modelling a systemctl error on the initial restart.
-        fail_first_reload: bool,
-        reloads: Cell<u32>,
-    }
-    impl MockActuator {
-        fn new() -> Self {
-            MockActuator {
-                log: RefCell::new(vec![]),
-                committed: Cell::new(false),
-                rolled_back: Cell::new(false),
-                fail_first_reload: false,
-                reloads: Cell::new(0),
-            }
-        }
-    }
-    impl Actuator for MockActuator {
-        fn stage(&mut self, _u: &str, _d: &str) -> Result<()> {
-            self.log.borrow_mut().push("stage".into());
-            Ok(())
-        }
-        fn rollback(&mut self, _u: &str) -> Result<()> {
-            self.rolled_back.set(true);
-            self.log.borrow_mut().push("rollback".into());
-            Ok(())
-        }
-        fn commit(&mut self) -> Result<()> {
-            self.committed.set(true);
-            self.log.borrow_mut().push("commit".into());
-            Ok(())
-        }
-        fn reload_restart(&mut self, _u: &str) -> Result<()> {
-            let n = self.reloads.get();
-            self.reloads.set(n + 1);
-            self.log.borrow_mut().push("reload_restart".into());
-            if self.fail_first_reload && n == 0 {
-                anyhow::bail!("systemctl restart failed");
-            }
-            Ok(())
-        }
-    }
+	struct MockActuator {
+		log: RefCell<Vec<String>>,
+		committed: Cell<bool>,
+		rolled_back: Cell<bool>,
+		/// Fail the FIRST reload_restart (the staged one); the revert reload still
+		/// succeeds, modelling a systemctl error on the initial restart.
+		fail_first_reload: bool,
+		reloads: Cell<u32>,
+	}
+	impl MockActuator {
+		fn new() -> Self {
+			MockActuator {
+				log: RefCell::new(vec![]),
+				committed: Cell::new(false),
+				rolled_back: Cell::new(false),
+				fail_first_reload: false,
+				reloads: Cell::new(0),
+			}
+		}
+	}
+	impl Actuator for MockActuator {
+		fn stage(&mut self, _u: &str, _d: &str) -> Result<()> {
+			self.log.borrow_mut().push("stage".into());
+			Ok(())
+		}
+		fn rollback(&mut self, _u: &str) -> Result<()> {
+			self.rolled_back.set(true);
+			self.log.borrow_mut().push("rollback".into());
+			Ok(())
+		}
+		fn commit(&mut self) -> Result<()> {
+			self.committed.set(true);
+			self.log.borrow_mut().push("commit".into());
+			Ok(())
+		}
+		fn reload_restart(&mut self, _u: &str) -> Result<()> {
+			let n = self.reloads.get();
+			self.reloads.set(n + 1);
+			self.log.borrow_mut().push("reload_restart".into());
+			if self.fail_first_reload && n == 0 {
+				anyhow::bail!("systemctl restart failed");
+			}
+			Ok(())
+		}
+	}
 
-    struct MockHealth {
-        becomes_healthy: bool,
-        calls: Cell<u32>,
-        /// Successive `served()` observations (first = before swap, then after);
-        /// the last entry sticks once reached.
-        served_seq: Vec<Option<String>>,
-        sidx: Cell<usize>,
-    }
-    impl MockHealth {
-        fn new(becomes_healthy: bool, seq: Vec<Option<String>>) -> Self {
-            MockHealth {
-                becomes_healthy,
-                calls: Cell::new(0),
-                served_seq: seq,
-                sidx: Cell::new(0),
-            }
-        }
-    }
-    impl Health for MockHealth {
-        fn healthy(&self) -> bool {
-            self.calls.set(self.calls.get() + 1);
-            self.becomes_healthy
-        }
-        fn served(&self) -> Option<String> {
-            let i = self.sidx.get();
-            let v = self.served_seq.get(i).cloned().flatten();
-            if i + 1 < self.served_seq.len() {
-                self.sidx.set(i + 1);
-            }
-            v
-        }
-        fn warm(&self) {}
-    }
+	struct MockHealth {
+		becomes_healthy: bool,
+		calls: Cell<u32>,
+		/// Successive `served()` observations (first = before swap, then after);
+		/// the last entry sticks once reached.
+		served_seq: Vec<Option<String>>,
+		sidx: Cell<usize>,
+	}
+	impl MockHealth {
+		fn new(becomes_healthy: bool, seq: Vec<Option<String>>) -> Self {
+			MockHealth {
+				becomes_healthy,
+				calls: Cell::new(0),
+				served_seq: seq,
+				sidx: Cell::new(0),
+			}
+		}
+	}
+	impl Health for MockHealth {
+		fn healthy(&self) -> bool {
+			self.calls.set(self.calls.get() + 1);
+			self.becomes_healthy
+		}
+		fn served(&self) -> Option<String> {
+			let i = self.sidx.get();
+			let v = self.served_seq.get(i).cloned().flatten();
+			if i + 1 < self.served_seq.len() {
+				self.sidx.set(i + 1);
+			}
+			v
+		}
+		fn warm(&self) {}
+	}
 
-    fn fast_opts() -> SwapOpts {
-        SwapOpts {
-            health_attempts: 3,
-            health_interval: Duration::ZERO,
-            prewarm: false,
-            ..Default::default()
-        }
-    }
+	fn fast_opts() -> SwapOpts {
+		SwapOpts {
+			health_attempts: 3,
+			health_interval: Duration::ZERO,
+			prewarm: false,
+			..Default::default()
+		}
+	}
 
-    #[test]
-    fn swap_success_commits() {
-        let p = a_profile("_default");
-        let m = model("new.gguf", "llama", 5_000_000_000);
-        let mut act = MockActuator::new();
-        // before swap serves "old", after restart serves the new model -> success
-        let health = MockHealth::new(true, vec![Some("old.gguf".into()), Some("new.gguf".into())]);
-        let out = swap(
-            "llama-server.service",
-            &m,
-            &p,
-            "-c 4096 -ngl 99",
-            &fast_opts(),
-            &mut act,
-            &health,
-        )
-        .unwrap();
-        assert!(out.ok);
-        assert!(!out.reverted);
-        assert!(act.committed.get());
-        assert!(!act.rolled_back.get());
-    }
+	#[test]
+	fn swap_success_commits() {
+		let p = a_profile("_default");
+		let m = model("new.gguf", "llama", 5_000_000_000);
+		let mut act = MockActuator::new();
+		// before swap serves "old", after restart serves the new model -> success
+		let health = MockHealth::new(true, vec![Some("old.gguf".into()), Some("new.gguf".into())]);
+		let out = swap(
+			"llama-server.service",
+			&m,
+			&p,
+			"-c 4096 -ngl 99",
+			&fast_opts(),
+			&mut act,
+			&health,
+		)
+		.unwrap();
+		assert!(out.ok);
+		assert!(!out.reverted);
+		assert!(act.committed.get());
+		assert!(!act.rolled_back.get());
+	}
 
-    #[test]
-    fn swap_reload_failure_reverts_not_strands() {
-        // stage succeeds but the initial systemctl reload/restart errors: the swap
-        // must roll back (restore the prior drop-in) instead of stranding the node.
-        let p = a_profile("_default");
-        let m = model("new.gguf", "llama", 5_000_000_000);
-        let mut act = MockActuator::new();
-        act.fail_first_reload = true;
-        let health = MockHealth::new(true, vec![Some("old.gguf".into())]);
-        let out = swap(
-            "llama-server.service",
-            &m,
-            &p,
-            "-c 4096 -ngl 99",
-            &fast_opts(),
-            &mut act,
-            &health,
-        )
-        .unwrap();
-        assert!(!out.ok);
-        assert!(out.reverted);
-        assert!(act.rolled_back.get(), "must roll back on restart failure");
-        assert!(!act.committed.get());
-        assert!(out.detail.contains("staging/restart failed"));
-    }
+	#[test]
+	fn swap_reload_failure_reverts_not_strands() {
+		// stage succeeds but the initial systemctl reload/restart errors: the swap
+		// must roll back (restore the prior drop-in) instead of stranding the node.
+		let p = a_profile("_default");
+		let m = model("new.gguf", "llama", 5_000_000_000);
+		let mut act = MockActuator::new();
+		act.fail_first_reload = true;
+		let health = MockHealth::new(true, vec![Some("old.gguf".into())]);
+		let out = swap(
+			"llama-server.service",
+			&m,
+			&p,
+			"-c 4096 -ngl 99",
+			&fast_opts(),
+			&mut act,
+			&health,
+		)
+		.unwrap();
+		assert!(!out.ok);
+		assert!(out.reverted);
+		assert!(act.rolled_back.get(), "must roll back on restart failure");
+		assert!(!act.committed.get());
+		assert!(out.detail.contains("staging/restart failed"));
+	}
 
-    #[test]
-    fn swap_served_mismatch_reverts() {
-        // health is OK but the server still reports the OLD model after restart
-        // (a competing drop-in won) -> must be treated as a FAILED swap.
-        let p = a_profile("_default");
-        let m = model("new.gguf", "llama", 5_000_000_000);
-        let mut act = MockActuator::new();
-        let health = MockHealth::new(true, vec![Some("old.gguf".into())]); // sticks on "old"
-        let out = swap(
-            "llama-server.service",
-            &m,
-            &p,
-            "-c 4096 -ngl 99",
-            &fast_opts(),
-            &mut act,
-            &health,
-        )
-        .unwrap();
-        assert!(!out.ok);
-        assert!(out.reverted);
-        assert!(act.rolled_back.get());
-        assert!(!act.committed.get());
-        assert!(out.detail.contains("did not take"));
-    }
+	#[test]
+	fn swap_served_mismatch_reverts() {
+		// health is OK but the server still reports the OLD model after restart
+		// (a competing drop-in won) -> must be treated as a FAILED swap.
+		let p = a_profile("_default");
+		let m = model("new.gguf", "llama", 5_000_000_000);
+		let mut act = MockActuator::new();
+		let health = MockHealth::new(true, vec![Some("old.gguf".into())]); // sticks on "old"
+		let out = swap(
+			"llama-server.service",
+			&m,
+			&p,
+			"-c 4096 -ngl 99",
+			&fast_opts(),
+			&mut act,
+			&health,
+		)
+		.unwrap();
+		assert!(!out.ok);
+		assert!(out.reverted);
+		assert!(act.rolled_back.get());
+		assert!(!act.committed.get());
+		assert!(out.detail.contains("did not take"));
+	}
 
-    #[test]
-    fn swap_failure_auto_reverts() {
-        let p = a_profile("_default");
-        let m = model("bad.gguf", "llama", 5_000_000_000);
-        let mut act = MockActuator::new();
-        let health = MockHealth::new(false, vec![Some("old.gguf".into())]);
-        let out = swap(
-            "llama-server.service",
-            &m,
-            &p,
-            "-c 4096 -ngl 99",
-            &fast_opts(),
-            &mut act,
-            &health,
-        )
-        .unwrap();
-        assert!(!out.ok);
-        assert!(out.reverted);
-        assert!(act.rolled_back.get());
-        assert!(!act.committed.get());
-        assert!(out.detail.contains("reverted to `old.gguf`"));
-    }
+	#[test]
+	fn swap_failure_auto_reverts() {
+		let p = a_profile("_default");
+		let m = model("bad.gguf", "llama", 5_000_000_000);
+		let mut act = MockActuator::new();
+		let health = MockHealth::new(false, vec![Some("old.gguf".into())]);
+		let out = swap(
+			"llama-server.service",
+			&m,
+			&p,
+			"-c 4096 -ngl 99",
+			&fast_opts(),
+			&mut act,
+			&health,
+		)
+		.unwrap();
+		assert!(!out.ok);
+		assert!(out.reverted);
+		assert!(act.rolled_back.get());
+		assert!(!act.committed.get());
+		assert!(out.detail.contains("reverted to `old.gguf`"));
+	}
 
-    #[test]
-    fn swap_already_served_is_noop() {
-        let p = a_profile("_default");
-        let m = model("cur.gguf", "llama", 5_000_000_000);
-        let mut act = MockActuator::new();
-        let health = MockHealth::new(true, vec![Some("cur.gguf".into())]);
-        let out = swap(
-            "llama-server.service",
-            &m,
-            &p,
-            "-c 4096 -ngl 99",
-            &fast_opts(),
-            &mut act,
-            &health,
-        )
-        .unwrap();
-        assert!(out.ok);
-        assert!(!out.reverted);
-        assert!(act.log.borrow().is_empty()); // never touched the actuator
-    }
+	#[test]
+	fn swap_already_served_is_noop() {
+		let p = a_profile("_default");
+		let m = model("cur.gguf", "llama", 5_000_000_000);
+		let mut act = MockActuator::new();
+		let health = MockHealth::new(true, vec![Some("cur.gguf".into())]);
+		let out = swap(
+			"llama-server.service",
+			&m,
+			&p,
+			"-c 4096 -ngl 99",
+			&fast_opts(),
+			&mut act,
+			&health,
+		)
+		.unwrap();
+		assert!(out.ok);
+		assert!(!out.reverted);
+		assert!(act.log.borrow().is_empty()); // never touched the actuator
+	}
 
-    #[test]
-    fn winning_name_sorts_last() {
-        // no foreign drop-ins -> base name
-        assert_eq!(winning_name(&[]), "zzzzzz-llmtune.conf");
-        // a competitor that sorts after our base -> we must sort after IT
-        let foreign = vec![
-            "override.conf".to_string(),
-            "zz-9b.conf".to_string(),
-            "zzzzzz-model-select.conf".to_string(),
-        ];
-        let name = winning_name(&foreign);
-        for f in &foreign {
-            assert!(name.as_str() > f.as_str(), "{name} must sort after {f}");
-        }
-        // and it's still recognizable as ours
-        assert!(name.ends_with("-llmtune.conf"));
-    }
+	#[test]
+	fn winning_name_sorts_last() {
+		// no foreign drop-ins -> base name
+		assert_eq!(winning_name(&[]), "zzzzzz-llmtune.conf");
+		// a competitor that sorts after our base -> we must sort after IT
+		let foreign = vec![
+			"override.conf".to_string(),
+			"zz-9b.conf".to_string(),
+			"zzzzzz-model-select.conf".to_string(),
+		];
+		let name = winning_name(&foreign);
+		for f in &foreign {
+			assert!(name.as_str() > f.as_str(), "{name} must sort after {f}");
+		}
+		// and it's still recognizable as ours
+		assert!(name.ends_with("-llmtune.conf"));
+	}
 
-    // ---- M1: NixOS-safe serving path ----
+	// ---- M1: NixOS-safe serving path ----
 
-    #[test]
-    fn etc_writable_detection() {
-        // NixOS marker alone -> read-only, regardless of everything else
-        assert!(!etc_units_writable_from(true, None, ""));
-        // unit dir resolves into the nix store -> read-only
-        assert!(!etc_units_writable_from(
-            false,
-            Some(Path::new("/nix/store/abc-etc/systemd/system")),
-            ""
-        ));
-        // mount holding /etc/systemd/system is ro -> read-only
-        let mounts = "/dev/sda1 / ext4 rw,relatime 0 0\n\
-                      overlay /etc overlay ro,lowerdir=/x 0 0\n";
-        assert!(!etc_units_writable_from(false, None, mounts));
-        // plain rw box -> writable
-        let mounts = "/dev/sda1 / ext4 rw,relatime 0 0\n";
-        assert!(etc_units_writable_from(false, None, mounts));
-        // no tells at all (empty mounts) -> writable (fail open to /etc)
-        assert!(etc_units_writable_from(false, None, ""));
-    }
+	#[test]
+	fn etc_writable_detection() {
+		// NixOS marker alone -> read-only, regardless of everything else
+		assert!(!etc_units_writable_from(true, None, ""));
+		// unit dir resolves into the nix store -> read-only
+		assert!(!etc_units_writable_from(
+			false,
+			Some(Path::new("/nix/store/abc-etc/systemd/system")),
+			""
+		));
+		// mount holding /etc/systemd/system is ro -> read-only
+		let mounts = "/dev/sda1 / ext4 rw,relatime 0 0\n\
+						overlay /etc overlay ro,lowerdir=/x 0 0\n";
+		assert!(!etc_units_writable_from(false, None, mounts));
+		// plain rw box -> writable
+		let mounts = "/dev/sda1 / ext4 rw,relatime 0 0\n";
+		assert!(etc_units_writable_from(false, None, mounts));
+		// no tells at all (empty mounts) -> writable (fail open to /etc)
+		assert!(etc_units_writable_from(false, None, ""));
+	}
 
-    #[test]
-    fn mounted_ro_innermost_mount_wins() {
-        let p = Path::new("/etc/systemd/system");
-        // ro root, but a deeper rw mount over /etc wins
-        let m = "/dev/a / ext4 ro 0 0\ntmpfs /etc tmpfs rw 0 0\n";
-        assert!(!mounted_ro(m, p));
-        // rw root, ro /etc wins
-        let m = "/dev/a / ext4 rw 0 0\nsquash /etc squashfs ro 0 0\n";
-        assert!(mounted_ro(m, p));
-        // same mount point twice (overmount): the LATER line wins
-        let m = "/dev/a / ext4 rw 0 0\nsquash /etc squashfs ro 0 0\ntmpfs /etc tmpfs rw 0 0\n";
-        assert!(!mounted_ro(m, p));
-        // `ro` must match a whole option, not a substring (e.g. `errors=remount-ro`)
-        let m = "/dev/a / ext4 rw,errors=remount-ro 0 0\n";
-        assert!(!mounted_ro(m, p));
-        // escaped space in a mount point still matches by prefix rules
-        let m = "/dev/a / ext4 rw 0 0\ntmpfs /mnt/with\\040space tmpfs ro 0 0\n";
-        assert!(!mounted_ro(m, p));
-    }
+	#[test]
+	fn mounted_ro_innermost_mount_wins() {
+		let p = Path::new("/etc/systemd/system");
+		// ro root, but a deeper rw mount over /etc wins
+		let m = "/dev/a / ext4 ro 0 0\ntmpfs /etc tmpfs rw 0 0\n";
+		assert!(!mounted_ro(m, p));
+		// rw root, ro /etc wins
+		let m = "/dev/a / ext4 rw 0 0\nsquash /etc squashfs ro 0 0\n";
+		assert!(mounted_ro(m, p));
+		// same mount point twice (overmount): the LATER line wins
+		let m = "/dev/a / ext4 rw 0 0\nsquash /etc squashfs ro 0 0\ntmpfs /etc tmpfs rw 0 0\n";
+		assert!(!mounted_ro(m, p));
+		// `ro` must match a whole option, not a substring (e.g. `errors=remount-ro`)
+		let m = "/dev/a / ext4 rw,errors=remount-ro 0 0\n";
+		assert!(!mounted_ro(m, p));
+		// escaped space in a mount point still matches by prefix rules
+		let m = "/dev/a / ext4 rw 0 0\ntmpfs /mnt/with\\040space tmpfs ro 0 0\n";
+		assert!(!mounted_ro(m, p));
+	}
 
-    #[test]
-    fn privileged_argv_root_runs_direct() {
-        let args = ["systemctl", "restart", "u"];
-        // as root: the command itself, sudo-free (netboot image has no sudo)
-        let (prog, rest) = privileged_argv(&args, true);
-        assert_eq!(prog, "systemctl");
-        assert_eq!(rest, &["restart", "u"]);
-        // as a user: wrapped in sudo, argv untouched
-        let (prog, rest) = privileged_argv(&args, false);
-        assert_eq!(prog, "sudo");
-        assert_eq!(rest, &["systemctl", "restart", "u"]);
-    }
+	#[test]
+	fn privileged_argv_root_runs_direct() {
+		let args = ["systemctl", "restart", "u"];
+		// as root: the command itself, sudo-free (netboot image has no sudo)
+		let (prog, rest) = privileged_argv(&args, true);
+		assert_eq!(prog, "systemctl");
+		assert_eq!(rest, &["restart", "u"]);
+		// as a user: wrapped in the detected root method, argv untouched
+		let (prog, rest) = privileged_argv(&args, false);
+		let expected = match ROOT_METHOD.get().copied() {
+			Some(RootMethod::Sudo) => "sudo",
+			Some(RootMethod::Doas) => "doas",
+			None => "sudo",
+		};
+		assert_eq!(prog, expected);
+		assert_eq!(rest, &["systemctl", "restart", "u"]);
+	}
 
-    #[test]
-    fn must_be_noninteractive_only_when_tui_active() {
-        // The TUI can't safely prompt for a password (reported live in
-        // aibc250, Scent, 2026-09-14) - the real call always runs with `-n`
-        // while it's active, no separate check-then-call probe (that was the
-        // first version's TOCTOU gap, and the prompt still got through).
-        assert!(must_be_noninteractive(true), "TUI active -> always -n");
-        assert!(
-            !must_be_noninteractive(false),
-            "plain CLI, no TUI - interactive prompting works exactly as it always has"
-        );
-    }
+	#[test]
+	fn must_be_noninteractive_only_when_tui_active() {
+		// The TUI can't safely prompt for a password (reported live in
+		// aibc250, Scent, 2026-09-14) - the real call always runs with `-n`
+		// while it's active, no separate check-then-call probe (that was the
+		// first version's TOCTOU gap, and the prompt still got through).
+		assert!(must_be_noninteractive(true), "TUI active -> always -n");
+		assert!(
+			!must_be_noninteractive(false),
+			"plain CLI, no TUI - interactive prompting works exactly as it always has"
+		);
+	}
 
-    #[test]
-    fn sudo_failure_message_carries_captured_stderr() {
-        // A unit that was never installed/enabled: systemctl's own stderr is
-        // the whole point of a useful error here - it must survive into the
-        // message llmtune shows, not vanish into an inherited terminal write.
-        use std::os::unix::process::ExitStatusExt;
-        let status = std::process::ExitStatus::from_raw(1 << 8);
-        let msg = sudo_failure_message(
-            "systemctl",
-            &["reset-failed", "llama-server.service"],
-            status,
-            b"Failed to reset failed state of unit llama-server.service: \
-              Unit llama-server.service not loaded.\n",
-        );
-        assert!(
-            msg.contains("Unit llama-server.service not loaded"),
-            "{msg}"
-        );
-    }
+	#[test]
+	fn sudo_failure_message_carries_captured_stderr() {
+		// A unit that was never installed/enabled: systemctl's own stderr is
+		// the whole point of a useful error here - it must survive into the
+		// message llmtune shows, not vanish into an inherited terminal write.
+		use std::os::unix::process::ExitStatusExt;
+		let status = std::process::ExitStatus::from_raw(1 << 8);
+		let msg = sudo_failure_message(
+			"systemctl",
+			&["reset-failed", "llama-server.service"],
+			status,
+			b"Failed to reset failed state of unit llama-server.service: \
+				Unit llama-server.service not loaded.\n",
+		);
+		assert!(
+			msg.contains("Unit llama-server.service not loaded"),
+			"{msg}"
+		);
+	}
 
-    #[test]
-    fn sudo_failure_message_falls_back_without_stderr() {
-        use std::os::unix::process::ExitStatusExt;
-        let status = std::process::ExitStatus::from_raw(1 << 8);
-        let msg = sudo_failure_message("systemctl", &["restart", "u"], status, b"");
-        assert_eq!(msg, format!("systemctl [\"restart\", \"u\"] failed ({status})"));
-    }
+	#[test]
+	fn sudo_failure_message_falls_back_without_stderr() {
+		use std::os::unix::process::ExitStatusExt;
+		let status = std::process::ExitStatus::from_raw(1 << 8);
+		let msg = sudo_failure_message("systemctl", &["restart", "u"], status, b"");
+		assert_eq!(msg, format!("systemctl [\"restart\", \"u\"] failed ({status})"));
+	}
 
-    #[test]
-    fn parse_unit_env_reads_the_service_section() {
-        // shaped like the netboot image's declarative llama-server unit
-        let unit = "\
+	#[test]
+	fn parse_unit_env_reads_the_service_section() {
+		// shaped like the netboot image's declarative llama-server unit
+		let unit = "\
 [Unit]\n\
 Description=llama.cpp server\n\
 # Environment=NOT_PARSED=1 (wrong section, commented anyway)\n\
@@ -1568,170 +1889,174 @@ ExecStart=/bin/llama-server\n\
 \n\
 [Install]\n\
 Environment=NOT_SERVICE=1\n";
-        let env = parse_unit_env(unit);
-        assert_eq!(
-            env.get("VK_DRIVER_FILES").map(String::as_str),
-            Some("/nix/store/mesa26/share/vulkan/icd.d/radeon_icd.x86_64.json")
-        );
-        assert_eq!(
-            env.get("VK_LOADER_LAYERS_DISABLE").map(String::as_str),
-            Some("*")
-        );
-        assert_eq!(
-            env.get("LD_LIBRARY_PATH").map(String::as_str),
-            Some("/nix/store/llama/lib")
-        );
-        assert_eq!(env.get("A").map(String::as_str), Some("1"));
-        assert_eq!(env.get("B").map(String::as_str), Some("two words"));
-        assert!(!env.contains_key("NOT_PARSED"));
-        assert!(!env.contains_key("ALSO_COMMENTED"));
-        assert!(!env.contains_key("NOT_SERVICE"));
-    }
+		let env = parse_unit_env(unit);
+		assert_eq!(
+			env.get("VK_DRIVER_FILES").map(String::as_str),
+			Some("/nix/store/mesa26/share/vulkan/icd.d/radeon_icd.x86_64.json")
+		);
+		assert_eq!(
+			env.get("VK_LOADER_LAYERS_DISABLE").map(String::as_str),
+			Some("*")
+		);
+		assert_eq!(
+			env.get("LD_LIBRARY_PATH").map(String::as_str),
+			Some("/nix/store/llama/lib")
+		);
+		assert_eq!(env.get("A").map(String::as_str), Some("1"));
+		assert_eq!(env.get("B").map(String::as_str), Some("two words"));
+		assert!(!env.contains_key("NOT_PARSED"));
+		assert!(!env.contains_key("ALSO_COMMENTED"));
+		assert!(!env.contains_key("NOT_SERVICE"));
+	}
 
-    #[test]
-    fn parse_unit_env_bare_reset_clears() {
-        let unit = "[Service]\nEnvironment=A=1\nEnvironment=\nEnvironment=B=2\n";
-        let env = parse_unit_env(unit);
-        assert!(!env.contains_key("A"), "reset must clear earlier keys");
-        assert_eq!(env.get("B").map(String::as_str), Some("2"));
-    }
+	#[test]
+	fn parse_unit_env_bare_reset_clears() {
+		let unit = "[Service]\nEnvironment=A=1\nEnvironment=\nEnvironment=B=2\n";
+		let env = parse_unit_env(unit);
+		assert!(!env.contains_key("A"), "reset must clear earlier keys");
+		assert_eq!(env.get("B").map(String::as_str), Some("2"));
+	}
 
-    #[test]
-    fn merged_env_precedence() {
-        let mut base = BTreeMap::new();
-        base.insert("VK_DRIVER_FILES".to_string(), "/base/icd.json".to_string());
-        base.insert("LD_LIBRARY_PATH".to_string(), "/base/lib".to_string());
-        base.insert("KEEP_ME".to_string(), "yes".to_string());
-        let mut prof = BTreeMap::new();
-        prof.insert("VK_DRIVER_FILES".to_string(), "/prof/icd.json".to_string());
-        let m = merged_env(&base, Some("/opt/llama"), &prof);
-        // profile wins over base
-        assert_eq!(
-            m.get("VK_DRIVER_FILES").map(String::as_str),
-            Some("/prof/icd.json")
-        );
-        // resolved ld wins over the base unit's LD_LIBRARY_PATH
-        assert_eq!(
-            m.get("LD_LIBRARY_PATH").map(String::as_str),
-            Some("/opt/llama")
-        );
-        // untouched base keys are carried over
-        assert_eq!(m.get("KEEP_ME").map(String::as_str), Some("yes"));
-        // without a resolved ld, the base unit's survives
-        let m = merged_env(&base, None, &prof);
-        assert_eq!(
-            m.get("LD_LIBRARY_PATH").map(String::as_str),
-            Some("/base/lib")
-        );
-    }
+	#[test]
+	fn merged_env_precedence() {
+		let mut base = BTreeMap::new();
+		base.insert("VK_DRIVER_FILES".to_string(), "/base/icd.json".to_string());
+		base.insert("LD_LIBRARY_PATH".to_string(), "/base/lib".to_string());
+		base.insert("KEEP_ME".to_string(), "yes".to_string());
+		let mut prof = BTreeMap::new();
+		prof.insert("VK_DRIVER_FILES".to_string(), "/prof/icd.json".to_string());
+		let m = merged_env(&base, Some("/opt/llama"), &prof);
+		// profile wins over base
+		assert_eq!(
+			m.get("VK_DRIVER_FILES").map(String::as_str),
+			Some("/prof/icd.json")
+		);
+		// resolved ld wins over the base unit's LD_LIBRARY_PATH
+		assert_eq!(
+			m.get("LD_LIBRARY_PATH").map(String::as_str),
+			Some("/opt/llama")
+		);
+		// untouched base keys are carried over
+		assert_eq!(m.get("KEEP_ME").map(String::as_str), Some("yes"));
+		// without a resolved ld, the base unit's survives
+		let m = merged_env(&base, None, &prof);
+		assert_eq!(
+			m.get("LD_LIBRARY_PATH").map(String::as_str),
+			Some("/base/lib")
+		);
+	}
 
-    #[test]
-    fn dropin_carries_base_gpu_env_through_reset() {
-        // The netboot image's declarative unit sets the gfx1013 Vulkan env; the
-        // profile doesn't. The rendered drop-in must re-declare it AFTER the
-        // Environment= reset or the server silently falls back to CPU.
-        let p = a_profile("_default");
-        let mut base = BTreeMap::new();
-        base.insert(
-            "VK_DRIVER_FILES".to_string(),
-            "/nix/store/mesa26/icd.json".to_string(),
-        );
-        base.insert("VK_LOADER_LAYERS_DISABLE".to_string(), "*".to_string());
-        let out = render_dropin(
-            &p,
-            "/opt/llama/llama-server",
-            Some("/opt/llama"),
-            "-c 4096 -ngl 99",
-            Path::new("/models/m.gguf"),
-            "127.0.0.1",
-            8080,
-            &base,
-        );
-        let reset = out.find("Environment=\n").expect("env reset present");
-        let vk = out
-            .find("Environment=VK_DRIVER_FILES=/nix/store/mesa26/icd.json")
-            .expect("base VK_DRIVER_FILES carried over");
-        assert!(reset < vk, "carried env must come after the reset");
-        assert!(out.contains("Environment=VK_LOADER_LAYERS_DISABLE=*"));
-        // the resolved ld still wins the LD_LIBRARY_PATH slot
-        assert!(out.contains("Environment=LD_LIBRARY_PATH=/opt/llama"));
-    }
+	#[test]
+	fn dropin_carries_base_gpu_env_through_reset() {
+		// The netboot image's declarative unit sets the gfx1013 Vulkan env; the
+		// profile doesn't. The rendered drop-in must re-declare it AFTER the
+		// Environment= reset or the server silently falls back to CPU.
+		let p = a_profile("_default");
+		let mut base = BTreeMap::new();
+		base.insert(
+			"VK_DRIVER_FILES".to_string(),
+			"/nix/store/mesa26/icd.json".to_string(),
+		);
+		base.insert("VK_LOADER_LAYERS_DISABLE".to_string(), "*".to_string());
+		let out = render_dropin(
+			&p,
+			"/opt/llama/llama-server",
+			Some("/opt/llama"),
+			"-c 4096 -ngl 99",
+			Path::new("/models/m.gguf"),
+			"127.0.0.1",
+			8080,
+			&base,
+			DropinFormat::Systemd,
+		);
+		let reset = out.find("Environment=\n").expect("env reset present");
+		let vk = out
+			.find("Environment=VK_DRIVER_FILES=/nix/store/mesa26/icd.json")
+			.expect("base VK_DRIVER_FILES carried over");
+		assert!(reset < vk, "carried env must come after the reset");
+		assert!(out.contains("Environment=VK_LOADER_LAYERS_DISABLE=*"));
+		// the resolved ld still wins the LD_LIBRARY_PATH slot
+		assert!(out.contains("Environment=LD_LIBRARY_PATH=/opt/llama"));
+	}
 
-    #[test]
-    fn env_line_quotes_whitespace_values() {
-        assert_eq!(env_line("A", "plain"), "Environment=A=plain\n");
-        assert_eq!(env_line("B", "two words"), "Environment=\"B=two words\"\n");
-    }
+	#[test]
+	fn env_line_quotes_whitespace_values() {
+		assert_eq!(env_line("A", "plain", DropinFormat::Systemd), "Environment=A=plain\n");
+		assert_eq!(
+			env_line("B", "two words", DropinFormat::Systemd),
+			"Environment=\"B=two words\"\n"
+		);
+	}
 
-    #[test]
-    fn llmtune_prefix_classifies_all_llmtune_dropins() {
-        // The generic prefix must match every llmtune-written drop-in header,
-        // including the model-select one (clear_dropin removes the whole layer).
-        assert!(LLMTUNE_PREFIX.contains("AUTO-GENERATED by llmtune"));
-        assert!(MARKER.starts_with(LLMTUNE_PREFIX));
-        let safe = "# AUTO-GENERATED by llmtune. Safe fallback: an unloaded/cleared state no-ops\n";
-        let limits = "# AUTO-GENERATED by llmtune. Crash-loop guard: give up after 4 failed starts\n";
-        for body in [safe, limits, MARKER] {
-            assert!(body.contains(LLMTUNE_PREFIX), "must classify: {body}");
-        }
-        // A foreign conf must NOT be classified as llmtune-owned.
-        assert!(!"[Service]\nExecStart=/bin/true\n".contains(LLMTUNE_PREFIX));
-    }
+	#[test]
+	fn llmtune_prefix_classifies_all_llmtune_dropins() {
+		// The generic prefix must match every llmtune-written drop-in header,
+		// including the model-select one (clear_dropin removes the whole layer).
+		assert!(LLMTUNE_PREFIX.contains("AUTO-GENERATED by llmtune"));
+		assert!(MARKER.starts_with(LLMTUNE_PREFIX));
+		let safe = "# AUTO-GENERATED by llmtune. Safe fallback: an unloaded/cleared state no-ops\n";
+		let limits = "# AUTO-GENERATED by llmtune. Crash-loop guard: give up after 4 failed starts\n";
+		for body in [safe, limits, MARKER] {
+			assert!(body.contains(LLMTUNE_PREFIX), "must classify: {body}");
+		}
+		// A foreign conf must NOT be classified as llmtune-owned.
+		assert!(!"[Service]\nExecStart=/bin/true\n".contains(LLMTUNE_PREFIX));
+	}
 
 
-    #[test]
-    fn collect_dropins_unions_across_roots() {
-        let base = std::env::temp_dir().join(format!("llmtune-dropins-{}", std::process::id()));
-        let etc = base.join("etc/systemd/system/u.service.d");
-        let run = base.join("run/systemd/system/u.service.d");
-        let vendor = base.join("usr/lib/systemd/system/u.service.d");
-        for d in [&etc, &run, &vendor] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        // ours in /etc (writable), ours in /run (writable), an llmtune drop-in
-        // stranded in a read-only vendor root, and a foreign conf in /run (the
-        // image's bc250-swap override).
-        let ours_body = format!("# {MARKER}\n[Service]\n");
-        std::fs::write(etc.join("zzzzzz-llmtune.conf"), &ours_body).unwrap();
-        std::fs::write(run.join("zzzzzz-llmtune.conf"), &ours_body).unwrap();
-        std::fs::write(vendor.join("50-llmtune.conf"), &ours_body).unwrap();
-        std::fs::write(run.join("override.conf"), "[Service]\nExecStart=\n").unwrap();
-        // non-.conf files are ignored
-        std::fs::write(run.join("readme.txt"), "x").unwrap();
+	#[test]
+	fn collect_dropins_unions_across_roots() {
+		let base = std::env::temp_dir().join(format!("llmtune-dropins-{}", std::process::id()));
+		let etc = base.join("etc/systemd/system/u.service.d");
+		let run = base.join("run/systemd/system/u.service.d");
+		let vendor = base.join("usr/lib/systemd/system/u.service.d");
+		for d in [&etc, &run, &vendor] {
+			std::fs::create_dir_all(d).unwrap();
+		}
+		// ours in /etc (writable), ours in /run (writable), an llmtune drop-in
+		// stranded in a read-only vendor root, and a foreign conf in /run (the
+		// image's bc250-swap override).
+		let ours_body = format!("# {MARKER}\n[Service]\n");
+		std::fs::write(etc.join("zzzzzz-llmtune.conf"), &ours_body).unwrap();
+		std::fs::write(run.join("zzzzzz-llmtune.conf"), &ours_body).unwrap();
+		std::fs::write(vendor.join("50-llmtune.conf"), &ours_body).unwrap();
+		std::fs::write(run.join("override.conf"), "[Service]\nExecStart=\n").unwrap();
+		// non-.conf files are ignored
+		std::fs::write(run.join("readme.txt"), "x").unwrap();
 
-        let dirs = vec![(etc.clone(), true), (run.clone(), true), (vendor, false)];
-        let (ours, foreign) = collect_dropins_in(&dirs, |t| t.contains(MARKER));
-        let our_names: Vec<String> = ours
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        // both writable-root llmtune drop-ins are removable "ours"
-        assert!(our_names
-            .iter()
-            .any(|p| p.starts_with(&*etc.to_string_lossy())));
-        assert!(our_names
-            .iter()
-            .any(|p| p.starts_with(&*run.to_string_lossy()) && p.ends_with("zzzzzz-llmtune.conf")));
-        assert_eq!(ours.len(), 2);
-        // the read-only-root llmtune conf and the foreign override are both
-        // "foreign" (must feed winning_name, can't be removed)
-        assert!(foreign.contains(&"50-llmtune.conf".to_string()));
-        assert!(foreign.contains(&"override.conf".to_string()));
-        assert!(!foreign.contains(&"readme.txt".to_string()));
-        // and the staged name out-sorts everything found anywhere
-        let name = winning_name(&foreign);
-        for f in &foreign {
-            assert!(name.as_str() > f.as_str());
-        }
-        std::fs::remove_dir_all(&base).unwrap();
-    }
+		let dirs = vec![(etc.clone(), true), (run.clone(), true), (vendor, false)];
+		let (ours, foreign) = collect_dropins_in(&dirs, |t| t.contains(MARKER));
+		let our_names: Vec<String> = ours
+			.iter()
+			.map(|p| p.to_string_lossy().into_owned())
+			.collect();
+		// both writable-root llmtune drop-ins are removable "ours"
+		assert!(our_names
+			.iter()
+			.any(|p| p.starts_with(&*etc.to_string_lossy())));
+		assert!(our_names
+			.iter()
+			.any(|p| p.starts_with(&*run.to_string_lossy()) && p.ends_with("zzzzzz-llmtune.conf")));
+		assert_eq!(ours.len(), 2);
+		// the read-only-root llmtune conf and the foreign override are both
+		// "foreign" (must feed winning_name, can't be removed)
+		assert!(foreign.contains(&"50-llmtune.conf".to_string()));
+		assert!(foreign.contains(&"override.conf".to_string()));
+		assert!(!foreign.contains(&"readme.txt".to_string()));
+		// and the staged name out-sorts everything found anywhere
+		let name = winning_name(&foreign);
+		for f in &foreign {
+			assert!(name.as_str() > f.as_str());
+		}
+		std::fs::remove_dir_all(&base).unwrap();
+	}
 
-    #[test]
-    fn split_quoted_handles_quotes() {
-        assert_eq!(
-            split_quoted("A=1 \"B=two words\" C='x y'"),
-            vec!["A=1", "B=two words", "C=x y"]
-        );
-        assert_eq!(split_quoted("  "), Vec::<String>::new());
-    }
+	#[test]
+	fn split_quoted_handles_quotes() {
+		assert_eq!(
+			split_quoted("A=1 \"B=two words\" C='x y'"),
+			vec!["A=1", "B=two words", "C=x y"]
+		);
+		assert_eq!(split_quoted("  "), Vec::<String>::new());
+	}
 }

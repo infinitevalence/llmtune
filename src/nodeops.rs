@@ -158,7 +158,11 @@ pub fn load(node: &Node, query: &str) -> Result<(swap::SwapOutcome, bool, bool)>
         base_env: swap::unit_base_env(&node.llama_unit),
         ..Default::default()
     };
-    let mut act = swap::SystemdActuator::new();
+    let mut act = if crate::init::is_systemd() {
+	  swap::AnyActuator::Systemd(swap::SystemdActuator::new())
+	} else {
+	  swap::AnyActuator::Openrc(swap::OpenrcActuator::new())
+	};
     let health = swap::HttpHealth {
         url: node.llama_url.clone(),
     };

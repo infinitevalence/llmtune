@@ -159,6 +159,11 @@ pub fn up<W: WorkerCtl, A: swap::Actuator, H: swap::Health>(
         &opts.host,
         opts.port,
         &opts.base_env,
+  	  	  if crate::init::is_systemd() {
+  	  	  	swap::DropinFormat::Systemd
+  	  	} else {
+  	  	  	swap::DropinFormat::OpenRC
+  	  	},
     );
     // A stage/restart ERROR (not just an unhealthy head) must still stop the
     // workers already running, or `?` leaks live rpc-servers across the rack.
