@@ -34,7 +34,7 @@ impl PathResolver for PlatformPathResolver {
         crate::paths::config_file(name)
     }
 
-    fn write_api_key_file(unit: &str, api_key: &str) -> Result<PathBuf> {
+    fn write_api_key_file(_unit: &str, api_key: &str) -> Result<PathBuf> {
         let path = crate::paths::shared_state_dir().join("api-key");
         crate::platform::init::sudo_tee_secret(&path, api_key)?;
         Ok(path)

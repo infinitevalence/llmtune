@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Init system detection, root elevation, sudo execution, and service control.
 
+#![allow(dead_code)]
+
 use std::sync::OnceLock;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, ExitStatus};

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Nvidia GPU telemetry implementation.
 
+#![allow(dead_code)]
+
 use crate::platform::GpuTelemetry;
 use crate::platform::TelemetryData;
 

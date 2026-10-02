@@ -9,11 +9,10 @@
 use crate::llama;
 use crate::model::Model;
 use crate::profile::Profile;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Result of a swap attempt.
@@ -811,6 +810,7 @@ fn collect_openrc_dropins(unit: &str) -> (Vec<PathBuf>, Vec<String>) {
 /// when writable, /run always), plus the filenames of everything else -
 /// foreign drop-ins anywhere, and llmtune drop-ins stuck in read-only roots
 /// (counted as foreign so the staged winning name still out-sorts them).
+#[allow(dead_code)]
 fn collect_dropins(unit: &str) -> (Vec<PathBuf>, Vec<String>) {
 	let install = unit_install_dir();
 	let dirs: Vec<(PathBuf, bool)> = dropin_scan_dirs(unit)
@@ -897,6 +897,7 @@ fn read_dropin(path: &Path) -> String {
 
 /// A drop-in filename guaranteed to sort lexicographically AFTER every foreign
 /// drop-in, so llmtune's `ExecStart` wins the systemd merge (last file wins).
+#[allow(dead_code)]
 fn winning_name(foreign: &[String]) -> String {
 	let base = "zzzzzz-llmtune.conf".to_string();
 	match foreign.iter().max() {

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! CPU-only telemetry impl (no GPU).
+//! CPU-only telemetry implementation.
+
+#![allow(dead_code)]
 
 use crate::platform::GpuTelemetry;
 use crate::platform::TelemetryData;

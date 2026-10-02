@@ -3,10 +3,11 @@
 //!
 //! Wireframe: fill in the TODO stubs.
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 // ==========================================================================
 // MODULE REGISTRY

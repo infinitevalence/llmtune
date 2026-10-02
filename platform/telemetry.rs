@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Telemetry helpers.
 
-use crate::platform::{MemoryBudget, TelemetryData};
-
+#[allow(dead_code)]
 pub fn parse_meminfo(text: &str) -> Option<(u32, u32)> {
     let mut total = 0u64;
     let mut avail = 0u64;

@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! File locking - unix flock.
+//! Advisory file lock implementation.
+
+#![allow(dead_code)]
 
 use crate::platform::{Lock, LockResult};
 use anyhow::Result;
-use std::path::PathBuf;
 
-pub struct PlatformLock {
-    lock_path: PathBuf,
-}
+pub struct PlatformLock;
 
 impl PlatformLock {
     pub fn new() -> Self {
-        PlatformLock {
-            lock_path: PathBuf::from("/tmp/llmtune.lock"),
-        }
+        PlatformLock
     }
 }
 
