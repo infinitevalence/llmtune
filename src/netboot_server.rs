@@ -27,6 +27,10 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, Netboot, Transport};
 use crate::netboot::HTTP_UNIT;
+use crate::pkg::install_cmd;
+
+
+/// Generate an install command using the shared pkg module. fn install_cmd
 
 /// The exports drop-in this module owns (the MODEL LIBRARY export; the
 /// diskless-root export from `netboot init` is a separate file).
@@ -845,7 +849,7 @@ fn priv_output(args: &[&str], interactive: bool) -> Option<String> {
 		c.args(&args[1..]);
 		c
 	} else {
-		let mut c = std::process::Command::new("sudo");
+		let mut c = std::process::Command::new(crate::swap::root_cmd());
 		if !interactive {
 			c.arg("-n");
 		}
@@ -859,28 +863,58 @@ fn priv_output(args: &[&str], interactive: bool) -> Option<String> {
 }
 
 fn is_active(svc: &str) -> String {
-	std::process::Command::new("systemctl")
-		.args(["is-active", svc])
-		.output()
-		.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-		.unwrap_or_else(|_| "unknown".into())
+	if crate::init::is_systemd() {
+		std::process::Command::new("systemctl")
+			.args(["is-active", svc])
+			.output()
+			.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+			.unwrap_or_else(|_| "unknown".into())
+	} else {
+		std::process::Command::new("rc-status")
+			.args(["-q", "--query", svc])
+			.output()
+			.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+			.unwrap_or_else(|_| "unknown".into())
+	}
 }
 
 fn is_enabled(svc: &str) -> String {
-	std::process::Command::new("systemctl")
-		.args(["is-enabled", svc])
-		.output()
-		.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-		.unwrap_or_else(|_| "unknown".into())
+	if crate::init::is_systemd() {
+		std::process::Command::new("systemctl")
+			.args(["is-enabled", svc])
+			.output()
+			.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+			.unwrap_or_else(|_| "unknown".into())
+	} else {
+		match std::process::Command::new("rc-update")
+			.args(["show", "--bare", "default"])
+			.output() {
+			Ok(o) => match String::from_utf8(o.stdout) {
+				Ok(s) => {
+					if s.split_whitespace().any(|name| name == svc) {
+						"enabled".into()
+					} else {
+						"unknown".into()
+					}
+				},
+				Err(_) => "unknown".into(),
+			},
+			Err(_) => "unknown".into(),
+		}
+	}
 }
 
 /// The unit's fragment path ("" = unit unknown to systemd).
 fn unit_fragment(svc: &str) -> String {
-	std::process::Command::new("systemctl")
-		.args(["show", "-p", "FragmentPath", "--value", svc])
-		.output()
-		.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-		.unwrap_or_default()
+	if crate::init::is_systemd() {
+		std::process::Command::new("systemctl")
+			.args(["show", "-p", "FragmentPath", "--value", svc])
+			.output()
+			.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+			.unwrap_or_default()
+	} else {
+		"".into()
+	}
 }
 
 /// The stack this config runs: HTTP always, NFS always, dnsmasq when enabled.
@@ -1015,9 +1049,9 @@ pub fn up(cfg: &Config, opts: &UpOpts) -> Result<()> {
 	}
 	if !have_cmd("exportfs") {
 		bail!(
-			"nfs-utils is not installed (no exportfs found) - install it \
-			 (arch: pacman -S nfs-utils; debian: apt install nfs-kernel-server) \
-			 and re-run `llmtune netboot up`"
+			"nfs-utils is not installed (no exportfs found) - {} \
+			 and re-run `llmtune netboot up`",
+			install_cmd("nfs-utils")
 		);
 	}
 	if nb.dnsmasq && !have_cmd("dnsmasq") {
@@ -1047,8 +1081,13 @@ pub fn up(cfg: &Config, opts: &UpOpts) -> Result<()> {
 	for svc in stack(nb) {
 		let was_active = is_active(svc) == "active";
 		let was_enabled = is_enabled(svc) == "enabled";
-		crate::swap::sudo(&["systemctl", "enable", "--now", svc])
-			.with_context(|| format!("starting {svc}"))?;
+		if crate::init::is_systemd() {
+			crate::swap::sudo(&["systemctl", "enable", "--now", svc])
+				.with_context(|| format!("starting {svc}"))?;
+		} else {
+			crate::swap::sudo(&["rc-update", "add", "--sysvinit", svc])
+				.with_context(|| format!("starting {svc}"))?;
+		}
 		if !was_active {
 			st.started.push(svc.to_string());
 		}
@@ -1339,7 +1378,12 @@ pub fn down(cfg: &Config, json: bool) -> Result<()> {
 			}
 			// Services: stop/disable only what `up` started/enabled.
 			for svc in st.started.iter().rev() {
-				match crate::swap::sudo(&["systemctl", "stop", svc]) {
+				let argv = if crate::init::is_systemd() {
+					vec!["systemctl", "stop", svc].into_boxed_slice()
+				} else {
+					vec!["rc-service", "stop", svc].into_boxed_slice()
+				};
+				match crate::swap::sudo(&argv[..]) {
 					Ok(()) => undone.push(format!("stopped {svc}")),
 					Err(e) => {
 						residual.started.push(svc.clone());
@@ -1348,7 +1392,12 @@ pub fn down(cfg: &Config, json: bool) -> Result<()> {
 				}
 			}
 			for svc in &st.enabled {
-				if crate::swap::sudo(&["systemctl", "disable", svc]).is_err() {
+				let argv = if crate::init::is_systemd() {
+					vec!["systemctl", "disable", svc].into_boxed_slice()
+				} else {
+					vec!["rc-update", "del", "--sysvinit", svc].into_boxed_slice()
+				};
+				if crate::swap::sudo(&argv[..]).is_err() {
 					residual.enabled.push(svc.clone());
 					failed.push(format!("disable {svc}"));
 				}
@@ -1377,7 +1426,12 @@ pub fn down(cfg: &Config, json: bool) -> Result<()> {
 					state_path(nb).display()
 				),
 			);
-			let _ = crate::swap::sudo(&["systemctl", "disable", "--now", HTTP_UNIT]);
+			let argv = if crate::init::is_systemd() {
+				vec!["systemctl", "disable", "--now", HTTP_UNIT].into_boxed_slice()
+			} else {
+				vec!["rc-update", "del", HTTP_UNIT].into_boxed_slice()
+			};
+			let _ = crate::swap::sudo(&argv[..]);
 			undone.push(format!("stopped {HTTP_UNIT}"));
 			if Path::new(MODELS_EXPORTS).exists() {
 				crate::swap::sudo(&["rm", "-f", MODELS_EXPORTS])?;

@@ -112,7 +112,7 @@ impl LockGuard {
 		// retry window we still correctly report Busy for real contention. The
 		// retry exists because EWOULDBLOCK can be *transient with no real
 		// contention*: when another thread in this process spawns a subprocess
-		// (fork+exec of ssh/systemctl/git/cmake), the child momentarily inherits
+		// (fork+exec of ssh/init-system/git/cmake), the child momentarily inherits
 		// this fd during the window before execve fires O_CLOEXEC, so the flock
 		// counts as held until the child execs. Without the retry, a swap/bench/
 		// build could then spuriously fail as "busy" (and the test suite flakes,

@@ -51,10 +51,10 @@ use widgets::split_flags;
 use widgets::{dwidth, wrap_display};
 
 /// Best-effort terminal teardown: leave raw mode + the alternate screen, and
-/// tell `swap::sudo` the TUI no longer owns the terminal. Safe to call more
-/// than once, and from a panic hook (so a panic mid-draw doesn't leave the
-/// user's terminal in raw mode with no echo, or the sudo-refusal flag stuck
-/// on for the rest of the process).
+/// signal that the TUI no longer owns the terminal so privileged calls
+/// refuse to prompt. Safe to call more than once, and from a panic hook
+/// (so a panic mid-draw doesn't leave the user's terminal in raw mode
+/// with no echo, or the refusal flag stuck on for the rest of the process).
 fn restore_terminal() {
 	let _ = disable_raw_mode();
 	let _ = stdout().execute(LeaveAlternateScreen);
@@ -64,9 +64,9 @@ fn restore_terminal() {
 pub fn run(cfg: Config, config_path: Option<String>) -> Result<()> {
 	enable_raw_mode()?;
 	stdout().execute(EnterAlternateScreen)?;
-	// From here, a privileged call that would need an interactive sudo
-	// prompt refuses instead of risking one it can't safely show or let the
-	// user answer (see `swap::sudo`).
+	// From here, the TUI owns the terminal; privileged calls refuse to
+	// prompt interactively, avoiding a password prompt that can't be answered
+	// inside the alternate screen.
 	crate::swap::set_tui_active(true);
 	// Chain a panic hook that restores the terminal before the default handler
 	// prints the panic - otherwise a panic in the draw/event loop corrupts the tty.
@@ -1176,11 +1176,7 @@ impl CockpitApp {
 				if !self.node.busy() {
 					// Probe active-state ONCE here, not on every dialog frame.
 					self.node.server_active = matches!(self.node.node.transport, Transport::Local)
-						&& std::process::Command::new("systemctl")
-							.args(["is-active", "--quiet", &self.node.node.llama_unit])
-							.status()
-							.map(|s| s.success())
-							.unwrap_or(false);
+						&& crate::init::service_active(&self.node.node.llama_unit);
 					self.node.mode = Mode::ConfirmServer;
 				}
 			}
@@ -1891,17 +1887,13 @@ impl NodeApp {
 			.map(|s| s.success())
 			.unwrap_or(false);
 		let action = if active { "stop" } else { "start" };
-		match crate::swap::sudo(&["systemctl", action, &unit]) {
-			Ok(()) => {
-				self.status = if active {
-					format!("stopped {unit} - GPU freed for testing ([s] to start)")
-				} else {
-					format!("started {unit}")
-				};
-				self.refresh();
-			}
-			Err(e) => self.status = format!("server {action} failed: {e}"),
-		}
+		crate::init::service_ctl(&unit, action);
+		self.status = if active {
+			format!("stopped {unit} - GPU freed for testing ([s] to start)")
+		} else {
+			format!("started {unit}")
+		};
+		self.refresh();
 	}
 
 	/// Explicit server action (used for restart; stop/start go through the

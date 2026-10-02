@@ -331,17 +331,22 @@ pub(crate) fn cmd_cluster_up(
 			 fleet-facing interface to narrow exposure."
 		);
 	}
+	let fmt = if crate::init::is_systemd() {
+		swap::DropinFormat::Systemd
+	} else {
+		swap::DropinFormat::OpenRC
+	};
 	let (host, port) = nodeops::parse_bind(&head.llama_url);
 	let opts = swap::SwapOpts {
 		host,
 		port,
 		// Carry the head's base-unit env (e.g. a declarative Vulkan stack)
 		// through the drop-in's Environment= reset.
-		base_env: swap::unit_base_env(&head.llama_unit),
+		base_env: swap::unit_base_env(&head.llama_unit, fmt),
 		..Default::default()
 	};
 	let mut wctl = cluster::RealWorkerCtl::new();
-	let mut head_act = if crate::init::is_systemd() {
+	let mut head_act = if matches!(fmt, swap::DropinFormat::Systemd) {
 	  swap::AnyActuator::Systemd(swap::SystemdActuator::new())
 	} else {
 	  swap::AnyActuator::Openrc(swap::OpenrcActuator::new())
@@ -434,10 +439,15 @@ pub(crate) fn cmd_cluster_down(cfg: &Config, cluster_name: &str, json: bool) -> 
 	// reported so the operator can stop them by hand.
 	let (workers, unknown) = resolve_workers_lenient(cfg, &cl.workers);
 	for u in &unknown {
+		let svc = if crate::init::is_systemd() {
+			"systemctl stop"
+		} else {
+			"rc-service stop"
+		};
 		eprintln!(
 			"WARNING: worker `{u}` is not in the fleet config - cannot stop its \
 			 rpc-server from here. If the board is still up, stop it by hand: \
-			 `systemctl stop llmtune-rpc-{}` on the worker.",
+			 `{svc} llmtune-rpc-{}` on the worker.",
 			cl.rpc_port
 		);
 	}

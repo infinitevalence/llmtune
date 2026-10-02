@@ -27,9 +27,10 @@ impl Transport {
 	}
 }
 
-/// A systemd unit name safe to interpolate into a path (`/etc/systemd/system/
-/// <unit>`, its `.d/` drop-in dir, and `systemctl <unit>`). Rejects `/` and `..`
-/// so a config value can't turn setup's `sudo tee` into an arbitrary-path write.
+/// A unit name safe to interpolate into paths (`/etc/systemd/system/<unit>`,
+/// its `.d/` drop-in dir, and `systemctl <unit>` / `rc-service <unit>`).
+/// Rejects `/` and `..` so a config value can't turn setup's `sudo tee` into
+/// an arbitrary-path write.
 fn valid_unit_name(s: &str) -> bool {
 	!s.is_empty()
 		&& s.ends_with(".service")
@@ -641,7 +642,7 @@ impl Config {
 			if !valid_unit_name(&llama_unit) {
 				bail!(
 					"node '{}': invalid llama_unit '{llama_unit}' \
-					 (must be a systemd unit name ending in .service, no '/' or '..')",
+					 (must be a unit name ending in .service, no '/' or '..')",
 					n.name
 				);
 			}
@@ -682,9 +683,9 @@ impl Config {
 				power_cmd: None,
 			});
 		}
-		// rpc_bin (the remote command systemd-run runs) and rpc_bind (an -H
-		// value) reach a `sudo systemd-run` argv; a leading '-' would be parsed as
-		// an option (arbitrary systemd-run property = root command execution).
+		// rpc_bin (the remote command init system binary runs) and rpc_bind (an -H
+		// value) reach a sudo + argv array; a leading '-' would be parsed as
+		// an option (arbitrary init-system property = root command execution).
 		for c in &raw.clusters {
 			if c.rpc_bin
 				.as_deref()

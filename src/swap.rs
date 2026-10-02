@@ -6,7 +6,6 @@
 //! and bounced) and a [`Health`] probe (how we tell whether the new model came
 //! up), so the swap logic is unit-tested with mocks - no BC-250 required.
 
-use crate::init::is_systemd;
 use crate::llama;
 use crate::model::Model;
 use crate::profile::Profile;
@@ -49,6 +48,7 @@ pub struct SwapOpts {
 	/// VK_DRIVER_FILES/VK_LOADER_LAYERS_DISABLE/LD_LIBRARY_PATH - without
 	/// which llama-server silently falls back to CPU).
 	pub base_env: BTreeMap<String, String>,
+	pub fmt: DropinFormat,
 }
 
 impl Default for SwapOpts {
@@ -60,6 +60,7 @@ impl Default for SwapOpts {
 			health_interval: Duration::from_secs(5),
 			prewarm: true,
 			base_env: BTreeMap::new(),
+			fmt: DropinFormat::Systemd,
 		}
 	}
 }
@@ -267,27 +268,30 @@ fn env_line(k: &str, v: &str, fmt: DropinFormat) -> String {
 /// Systemd: reads via `systemctl show -p FragmentPath`.
 /// OpenRC: reads from `/etc/conf.d/{unit}`.
 /// Best-effort: a missing unit (or no systemctl) yields an empty map.
-pub fn unit_base_env(unit: &str) -> BTreeMap<String, String> {
-	if is_systemd() {
-		let frag = Command::new("systemctl")
-			.args(["show", "-p", "FragmentPath", "--value", unit])
-			.output()
-			.ok()
-			.and_then(|o| String::from_utf8(o.stdout).ok())
-			.map(|s| s.trim().to_string())
-			.unwrap_or_default();
-		if frag.is_empty() {
-			return BTreeMap::new();
+pub fn unit_base_env(unit: &str, fmt: DropinFormat) -> BTreeMap<String, String> {
+	match fmt {
+		DropinFormat::Systemd => {
+			let frag = Command::new("systemctl")
+				.args(["show", "-p", "FragmentPath", "--value", unit])
+				.output()
+				.ok()
+				.and_then(|o| String::from_utf8(o.stdout).ok())
+				.map(|s| s.trim().to_string())
+				.unwrap_or_default();
+			if frag.is_empty() {
+				return BTreeMap::new();
+			}
+			std::fs::read_to_string(&frag)
+				.map(|t| parse_unit_env(&t))
+				.unwrap_or_default()
 		}
-		std::fs::read_to_string(&frag)
-			.map(|t| parse_unit_env(&t))
-			.unwrap_or_default()
-	} else {
-		// OpenRC: /etc/conf.d/{unit} uses export K=V or bare K=V
-		let path = format!("/etc/conf.d/{}", unit);
-		std::fs::read_to_string(&path)
-			.map(|t| parse_openrc_env(&t))
-			.unwrap_or_default()
+		DropinFormat::OpenRC => {
+			// /etc/conf.d/{unit} uses export K=V or bare K=V
+			let path = format!("/etc/conf.d/{}", unit);
+			std::fs::read_to_string(&path)
+				.map(|t| parse_openrc_env(&t))
+				.unwrap_or_default()
+		}
 	}
 }
 
@@ -472,11 +476,7 @@ pub fn swap<A: Actuator, H: Health>(
 		&opts.host,
 		opts.port,
 		&opts.base_env,
-		if is_systemd() {
-			DropinFormat::Systemd
-		} else {
-			DropinFormat::OpenRC
-		},
+		opts.fmt,
 	);
 	// Stage the new drop-in and restart. If EITHER step errors, the previous
 	// drop-in has already been removed/replaced, so roll back before returning -
@@ -526,7 +526,7 @@ pub fn swap<A: Actuator, H: Health>(
 					"swap did not take - server still serves `{s}`, not `{}` \
 					 (a competing {} drop-in is overriding llmtune's)",
 					model.name,
-					if is_systemd() { "systemd" } else { "OpenRC" }
+					match opts.fmt { DropinFormat::Systemd => "systemd", DropinFormat::OpenRC => "OpenRC" }
 				);
 				let detail = if reverted {
 					format!("{why}; reverted")
@@ -604,25 +604,28 @@ pub fn poll_health<H: Health>(health: &H, opts: &SwapOpts) -> bool {
 
 /// Remove ALL llmtune drop-ins for a unit and bounce it (used by `cluster
 /// down` to return the head to its base, non-clustered config).
-pub fn clear_dropin(unit: &str) -> Result<()> {
+pub fn clear_dropin(unit: &str, fmt: DropinFormat) -> Result<()> {
 	// Remove EVERY llmtune drop-in (model-select + safe fallback + crash-loop
 	// guard), not just the model-select one: while the safe-fallback conf is
 	// present the effective ExecStart stays `/bin/false`, so a plain restart
 	// would leave the old llama-server process running with the model still
 	// resident in VRAM. With all llmtune drop-ins gone the base unit's own
 	// ExecStart returns and the restart actually stops the server.
-	let (ours, _) = collect_dropins_llmtune(unit);
+	let (ours, _) = collect_dropins_llmtune(unit, fmt);
 	for p in ours {
 		sudo(&["rm", "-f", &p.to_string_lossy()])?;
 	}
-	if is_systemd() {
-		sudo(&["systemctl", "daemon-reload"])?;
-		// Clear any start-limit-hit from a prior crash-loop so a new (good) model
-		// can start instead of being refused by the crash-loop guard.
-		let _ = sudo(&["systemctl", "reset-failed", unit]);
-		sudo(&["systemctl", "restart", unit])?;
-	} else {
-		sudo(&["rc-service", unit, "restart"])?;
+	match fmt {
+		DropinFormat::Systemd => {
+			sudo(&["systemctl", "daemon-reload"])?;
+			// Clear any start-limit-hit from a prior crash-loop so a new (good) model
+			// can start instead of being refused by the crash-loop guard.
+			let _ = sudo(&["systemctl", "reset-failed", unit]);
+			sudo(&["systemctl", "restart", unit])?;
+		}
+		DropinFormat::OpenRC => {
+			sudo(&["rc-service", unit, "restart"])?;
+		}
 	}
 	Ok(())
 }
@@ -744,22 +747,22 @@ const LLMTUNE_PREFIX: &str = "AUTO-GENERATED by llmtune";
 /// (model-select, safe fallback, crash-loop guard) as removable "ours" when it
 /// sits in a writable root. Used by [`clear_dropin`]: an unload must remove the
 /// whole llmtune layer so the base unit's ExecStart governs again.
-fn collect_dropins_llmtune(unit: &str) -> (Vec<PathBuf>, Vec<String>) {
-	if is_systemd() {
-		// systemd: union scan across ALL drop-in roots (/etc, /run, vendor)
-		let install = unit_install_dir();
-		let dirs: Vec<(PathBuf, bool)> = dropin_scan_dirs(unit)
-			.into_iter()
-			.map(|d| {
-				// /run is always writable, even when /etc is the chosen install root.
-				let writable = d.starts_with(install) || d.starts_with(RUN_UNIT_DIR);
-				(d, writable)
-			})
-			.collect();
-		collect_dropins_in(&dirs, |t| t.contains(LLMTUNE_PREFIX))
-	} else {
-		// OpenRC: scan /etc/conf.d/<unit> and sibling conf files in /etc/conf.d/
-		collect_openrc_dropins(unit)
+fn collect_dropins_llmtune(unit: &str, fmt: DropinFormat) -> (Vec<PathBuf>, Vec<String>) {
+	match fmt {
+		DropinFormat::Systemd => {
+			// systemd: union scan across ALL drop-in roots (/etc, /run, vendor)
+			let install = unit_install_dir();
+			let dirs: Vec<(PathBuf, bool)> = dropin_scan_dirs(unit)
+				.into_iter()
+				.map(|d| {
+					// /run is always writable, even when /etc is the chosen install root.
+					let writable = d.starts_with(install) || d.starts_with(RUN_UNIT_DIR);
+					(d, writable)
+				})
+				.collect();
+			collect_dropins_in(&dirs, |t| t.contains(LLMTUNE_PREFIX))
+		}
+		DropinFormat::OpenRC => collect_openrc_dropins(unit),
 	}
 }
 
@@ -880,8 +883,13 @@ fn scan_dropins(dir: &Path, is_ours: &dyn Fn(&str) -> bool) -> (Vec<PathBuf>, Ve
 /// foreign, which leaves it un-removed and makes `winning_name` stack another
 /// `z-llmtune` segment on top of it every restage.
 fn read_dropin(path: &Path) -> String {
+	if let Ok(s) = std::fs::read_to_string(path) {
+		if !s.is_empty() || is_root() {
+			return s;
+		}
+	}
 	if is_root() {
-		return std::fs::read_to_string(path).unwrap_or_default();
+		return "".to_string();
 	}
 	Command::new(root_cmd())
 		.args(["cat", &path.to_string_lossy()])
@@ -966,7 +974,7 @@ fn detect_root_method() -> RootMethod {
 }
 
 /// Return the root-elevation binary detected at startup.
-fn root_cmd() -> &'static str {
+pub(crate) fn root_cmd() -> &'static str {
 	init_root_method();
 	match ROOT_METHOD.get().copied() {
 		Some(RootMethod::Sudo) => "sudo",
@@ -1063,11 +1071,10 @@ fn sudo_failure_message(
 
 /// The user a unit runs as. For systemd units this is the `User=` directive;
 /// for OpenRC units it is `RC_USER` from the `/etc/conf.d/<unit>` file.
-fn unit_user(unit: &str) -> String {
-	if is_systemd() {
-		unit_user_systemd(unit)
-	} else {
-		openrc_unit_user(unit)
+fn unit_user(unit: &str, fmt: DropinFormat) -> String {
+	match fmt {
+		DropinFormat::Systemd => unit_user_systemd(unit),
+		DropinFormat::OpenRC => openrc_unit_user(unit),
 	}
 }
 
@@ -1111,10 +1118,10 @@ fn openrc_unit_user(unit: &str) -> String {
 /// `--api-key <k>`. The key goes to the file via stdin (never argv), the file is
 /// 0600 (created that way, no world-readable window), and it is chowned to the
 /// user llama-server runs as so it can read it. Returns the path.
-pub(crate) fn write_api_key_file(unit: &str, key: &str) -> Result<String> {
+pub(crate) fn write_api_key_file(unit: &str, key: &str, fmt: DropinFormat) -> Result<String> {
 	let path = crate::paths::shared_state_dir().join("api-key");
 	let path_s = path.to_string_lossy().to_string();
-	let user = unit_user(unit);
+	let user = unit_user(unit, fmt);
 	if let Some(parent) = path.parent() {
 		sudo(&["mkdir", "-p", &parent.to_string_lossy()])?;
 	}

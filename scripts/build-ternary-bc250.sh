@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 # build-ternary-bc250.sh - build the PrismML llama.cpp fork (ternary Q2_0 kernels)
 # for the AMD BC-250 (gfx1013), NATIVELY on the board, with the Vulkan backend.
 #
@@ -9,7 +9,7 @@
 #
 # Usage:   ./build-ternary-bc250.sh [install_dir]
 # Default install_dir: ~/ternary-llama
-set -euo pipefail
+set -eu
 
 REPO="https://github.com/PrismML-Eng/llama.cpp"
 COMMIT="9fcaed763ccda38ea81068ad9d7f991aaddca451"   # BC-250-tested; Q1_0/Q2_0 kernels
@@ -27,14 +27,15 @@ miss=""
 for t in git cmake gcc g++ glslc; do command -v "$t" >/dev/null 2>&1 || miss="$miss $t"; done
 if [ -n "$miss" ]; then
   echo "  [fail] missing tools:$miss"
-  echo "  install them, e.g.:"
-  echo "    Arch/CachyOS: sudo pacman -S --needed base-devel cmake git shaderc vulkan-headers vulkan-radeon"
-  echo "    Debian/Ubuntu: sudo apt install build-essential cmake git glslc libvulkan-dev mesa-vulkan-drivers"
+
+  echo "  install them via your package manager, e.g.:"
+
+  echo "  required: git cmake gcc g++ glslc vulkan-headers vulkan runtime"
   exit 1
 fi
 echo "  [ok] toolchain present ($(cmake --version | head -1))"
 
-say "1/5  fetch fork @ ${COMMIT:0:10}  ->  $SRC"
+say "1/5  fetch fork @ $(printf '%.10s' "$COMMIT")  ->  $SRC"
 if [ -d "$SRC/.git" ]; then
   git -C "$SRC" fetch --depth 1 origin "$COMMIT" && git -C "$SRC" checkout -q "$COMMIT"
 else

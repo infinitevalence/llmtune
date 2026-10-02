@@ -35,7 +35,7 @@ pub(crate) struct Cli {
 pub(crate) enum Cmd {
 	/// Interactive TUI over the configured fleet (default).
 	Tui,
-	/// First-run setup: generate the systemd unit + starter config.
+	/// First-run setup: generate the init unit + starter config.
 	Setup {
 		/// Show the plan and generated files without writing anything.
 		#[arg(long)]
@@ -265,7 +265,7 @@ pub(crate) enum NodeCmd {
 	/// Remove llmtune's drop-ins and revert the unit to its base config, stopping
 	/// the server so the model is freed from VRAM.
 	Unload,
-	/// Tail llama-server's own systemd journal - what it actually printed
+	/// Tail llama-server's own journal — what it actually printed
 	/// loading/serving a model. Local node only (ssh onto a remote node and
 	/// run it there).
 	Logs {
@@ -329,9 +329,9 @@ pub(crate) enum NodeCmd {
 	},
 	/// Re-apply exposure/api-key + the last-served model after a reboot (which
 	/// reverts the root-subvol drop-in + firewall). Run with --install to add a
-	/// systemd oneshot that does this automatically on boot.
+	/// boot-time hook.
 	BootRestore {
-		/// Install + enable the boot-time systemd hook instead of running now.
+		/// Install + enable the boot-time hook instead of running now.
 		#[arg(long)]
 		install: bool,
 	},
@@ -475,7 +475,7 @@ pub(crate) enum NetbootCmd {
 	/// before `image build` / `up`. Previews everything; pass --apply to
 	/// write + reload.
 	Init {
-		/// Write the files (sudo) and reload, instead of previewing.
+		/// Write the files (elevated) and reload, instead of previewing.
 		#[arg(long)]
 		apply: bool,
 	},
@@ -546,7 +546,7 @@ pub(crate) enum NetbootCmd {
 		#[arg(long)]
 		duration_secs: Option<u64>,
 	},
-	/// Run the embedded artifact + iPXE HTTP server. systemd owns this; you don't
+	/// Run the embedded artifact + iPXE HTTP server. The init system owns this; you don't
 	/// normally run it by hand.
 	#[command(hide = true)]
 	Serve {

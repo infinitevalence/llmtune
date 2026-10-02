@@ -37,17 +37,13 @@ start to finish.
 
 `llmtune build install vulkan` compiles llama.cpp, which needs a C++ toolchain,
 CMake, git, the Vulkan headers + ICD loader, the SPIR-V headers, and a shader
-compiler. Install them in one line for your distro:
+compiler. Install them via your package manager, e.g.:
 
 ```sh
-# Arch / CachyOS / EndeavourOS / Manjaro
-sudo pacman -S --needed base-devel cmake git vulkan-headers vulkan-icd-loader spirv-headers shaderc
-
-# Debian / Ubuntu / Pop!_OS
-sudo apt install build-essential cmake git libvulkan-dev glslc spirv-headers
-
-# Fedora / RHEL
-sudo dnf install gcc-c++ cmake git vulkan-headers vulkan-loader-devel glslc spirv-headers
+# required packages: gcc/g++ cmake git glslc vulkan-headers vulkan-loader spirv-headers
+# Arch:  sudo pacman -S base-devel cmake git shaderc vulkan-headers vulkan.icd-loader
+# Debian: sudo apt install build-essential cmake git glslc libvulkan-dev spirv-headers
+# Fedora: sudo dnf install gcc-c++ cmake git glslc vulkan-headers vulkan-loader-devel
 ```
 
 You do not have to memorize this: `llmtune build install vulkan` (and `llmtune

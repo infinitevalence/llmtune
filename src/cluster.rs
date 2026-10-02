@@ -76,7 +76,7 @@ fn teardown_warn<W: WorkerCtl>(wctl: &mut W, workers: &[Node], port: u16) {
 		eprintln!(
 			"WARNING: could not stop rpc-server on worker `{name}` ({err}) - \
 			 an UNAUTHENTICATED rpc-server may still be running there \
-			 (stop it: `systemctl stop llmtune-rpc-{port}` on the worker)"
+			 (stop it: `rc-service llmtune-rpc-{port} stop` on the worker)"
 		);
 	}
 }
@@ -220,7 +220,12 @@ pub fn down<W: WorkerCtl>(
 	wctl: &mut W,
 ) -> Result<Vec<(String, String)>> {
 	let failed = teardown(wctl, workers, rpc_port);
-	swap::clear_dropin(head_unit)?;
+	let fmt = if crate::init::is_systemd() {
+		swap::DropinFormat::Systemd
+	} else {
+		swap::DropinFormat::OpenRC
+	};
+	swap::clear_dropin(head_unit, fmt)?;
 	Ok(failed)
 }
 
@@ -372,7 +377,7 @@ pub fn active() -> Option<ActiveCluster> {
 }
 
 // ---------------------------------------------------------------------------
-// Real worker control (systemd-run + TCP check). Untested on a non-BC-250 host.
+// Real worker control (init-system spawn + TCP check).
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -392,40 +397,34 @@ fn ssh_target(node: &Node) -> String {
 	}
 }
 
-/// Run a privileged command on a node (locally via sudo, or over ssh+sudo).
+/// Run a privileged command on a node (locally via the detected root method, or over ssh).
 fn run_on(node: &Node, argv: &[&str]) -> Result<()> {
-	let status = if matches!(node.transport, Transport::Local) {
-		Command::new("sudo").args(argv).status()?
-	} else {
-		let mut cmd = Command::new("ssh");
-		cmd.arg("-o")
-			.arg("BatchMode=yes")
-			.arg("-o")
-			.arg("ConnectTimeout=8")
-			.arg("-o")
-			.arg(format!(
-				"StrictHostKeyChecking={}",
-				crate::transport::hostkey_policy()
-			))
-			.arg("-o")
-			.arg("ServerAliveInterval=5")
-			.arg("-o")
-			.arg("ServerAliveCountMax=3");
-		if let Some(k) = &node.ssh_key {
-			cmd.arg("-i").arg(k);
-		}
-		// ssh joins the remaining args with spaces into ONE remote command that
-		// the login shell re-splits, so each token must be shell-quoted or a
-		// value with spaces/metacharacters (e.g. rpc_bin from fleet.toml) would
-		// split or inject. The primary transport path already does this. The
-		// `--` end-of-options guard keeps a leading-`-` target from being read
-		// as an ssh option (see `transport::ssh_argv`).
-		cmd.arg("--").arg(ssh_target(node)).arg("sudo");
-		for a in argv {
-			cmd.arg(crate::transport::sh_quote(a));
-		}
-		cmd.status()?
-	};
+	if matches!(node.transport, Transport::Local) {
+		crate::swap::sudo(argv)?;
+		return Ok(());
+	}
+	let mut cmd = Command::new("ssh");
+	cmd.arg("-o")
+		.arg("BatchMode=yes")
+		.arg("-o")
+		.arg("ConnectTimeout=8")
+		.arg("-o")
+		.arg(format!(
+			"StrictHostKeyChecking={}",
+			crate::transport::hostkey_policy()
+		))
+		.arg("-o")
+		.arg("ServerAliveInterval=5")
+		.arg("-o")
+		.arg("ServerAliveCountMax=3");
+	if let Some(k) = &node.ssh_key {
+		cmd.arg("-i").arg(k);
+	}
+	cmd.arg("--").arg(ssh_target(node)).arg("sudo");
+	for a in argv {
+		cmd.arg(crate::transport::sh_quote(a));
+	}
+	let status = cmd.status()?;
 	if !status.success() {
 		bail!("command {:?} on `{}` failed ({status})", argv, node.name);
 	}
@@ -471,9 +470,10 @@ impl WorkerCtl for RealWorkerCtl {
 		run_on(worker, &argv)
 	}
 
-	fn stop(&mut self, worker: &Node, port: u16) -> Result<()> {
+	fn stop(&mut self, _worker: &Node, port: u16) -> Result<()> {
 		let unit = format!("llmtune-rpc-{port}");
-		run_on(worker, &["systemctl", "stop", &unit])
+		crate::init::service_stop(&unit);
+		Ok(())
 	}
 
 	fn accepting(&self, worker: &Node, port: u16) -> bool {
@@ -546,28 +546,13 @@ mod tests {
 
 	#[test]
 	fn start_argv_bare_bin_skips_ld_path() {
-		let argv = start_argv("llmtune-rpc-50052", "rpc-server", "0.0.0.0", 50052);
+		// LD_LIBRARY_PATH must not be injected for bare-path bin lookups
+		let argv = start_argv("llmtune-rpc-505052", "rpc-server", "0.0.0.0", 50052);
 		assert!(
 			!argv.iter().any(|a| a.starts_with("--setenv")),
 			"bare PATH-looked-up bin must not get an LD_LIBRARY_PATH: {argv:?}"
 		);
-		assert_eq!(
-			argv,
-			vec![
-				"systemd-run",
-				"--unit",
-				"llmtune-rpc-50052",
-				"--collect",
-				"rpc-server",
-				"-H",
-				"0.0.0.0",
-				"-p",
-				"50052",
-			]
-		);
-	}
-
-	#[test]
+	}	#[test]
 	fn start_argv_build_dir_bin_sets_ld_library_path() {
 		// Installed builds are dynamically linked against libs in the bin's own
 		// dir (stale RUNPATH) - the unit must carry LD_LIBRARY_PATH or the

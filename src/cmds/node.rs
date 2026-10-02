@@ -169,11 +169,19 @@ pub(crate) fn cmd_node_server(
 		return cmd_node_server_remote(node, &unit, action, json);
 	}
 	let is_active = || {
-		std::process::Command::new("systemctl")
-			.args(["is-active", "--quiet", &unit])
-			.status()
-			.map(|s| s.success())
-			.unwrap_or(false)
+		if crate::init::is_systemd() {
+			std::process::Command::new("systemctl")
+				.args(["is-active", "--quiet", &unit])
+				.status()
+				.map(|s| s.success())
+				.unwrap_or(false)
+		} else {
+			std::process::Command::new("rc-status")
+				.args(["-q", "--query", &unit])
+				.status()
+				.map(|s| s.success())
+				.unwrap_or(false)
+		}
 	};
 	match action {
 		ServerAction::Status => {
@@ -185,7 +193,11 @@ pub(crate) fn cmd_node_server(
 			}
 		}
 		ServerAction::Stop => {
-			swap::sudo(&["systemctl", "stop", &unit])?;
+			if crate::init::is_systemd() {
+				swap::sudo(&["systemctl", "stop", &unit])?;
+			} else {
+				swap::sudo(&["rc-service", "stop", &unit])?;
+			}
 			if json {
 				println!("{}", serde_json::json!({"unit": unit, "result": "stopped"}));
 			} else {
@@ -193,7 +205,11 @@ pub(crate) fn cmd_node_server(
 			}
 		}
 		ServerAction::Start => {
-			swap::sudo(&["systemctl", "start", &unit])?;
+			if crate::init::is_systemd() {
+				swap::sudo(&["systemctl", "start", &unit])?;
+			} else {
+				swap::sudo(&["rc-service", "start", &unit])?;
+			}
 			if json {
 				println!("{}", serde_json::json!({"unit": unit, "result": "started"}));
 			} else {
@@ -201,7 +217,11 @@ pub(crate) fn cmd_node_server(
 			}
 		}
 		ServerAction::Restart => {
-			swap::sudo(&["systemctl", "restart", &unit])?;
+			if crate::init::is_systemd() {
+				swap::sudo(&["systemctl", "restart", &unit])?;
+			} else {
+				swap::sudo(&["rc-service", "restart", &unit])?;
+			}
 			if json {
 				println!(
 					"{}",
@@ -553,9 +573,17 @@ pub(crate) fn cmd_node_boot_restore(cfg: &Config, install: bool, json: bool) -> 
 	Ok(())
 }
 
-/// Write + enable the boot-time systemd oneshot. Runs as the invoking user so it
-/// resolves the same settings + (durable) binary. Returns the unit name.
+/// Write + enable the boot-time restore hook. systemd: oneshot unit;
+/// OpenRC: init.d script in bootmisc. Returns the service name.
 pub(crate) fn install_restore_hook() -> Result<String> {
+	if crate::init::is_systemd() {
+		install_restore_hook_systemd()
+	} else {
+		install_restore_hook_openrc()
+	}
+}
+
+fn install_restore_hook_systemd() -> Result<String> {
 	let bin = std::env::current_exe()?.display().to_string();
 	let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
 	let unit_name = "llmtune-restore.service";
@@ -573,9 +601,6 @@ pub(crate) fn install_restore_hook() -> Result<String> {
 		 [Install]\n\
 		 WantedBy=multi-user.target\n"
 	);
-	// /etc on a normal install; /run when /etc's unit dir is read-only (the
-	// NixOS netboot image) - with a --runtime enable, since a persistent
-	// enable would try to symlink into the read-only /etc.
 	let dir = swap::unit_install_dir();
 	let path_s = format!("{dir}/{unit_name}");
 	swap::sudo_tee(std::path::Path::new(&path_s), &unit)?;
@@ -588,10 +613,33 @@ pub(crate) fn install_restore_hook() -> Result<String> {
 	Ok(unit_name.to_string())
 }
 
+fn install_restore_hook_openrc() -> Result<String> {
+	let bin = std::env::current_exe()?.display().to_string();
+	let script = format!(
+		"#!/sbin/openrc-run\n\
+		 \n\
+		 description=\"llmtune boot-restore: re-apply exposure/api-key + served model\"\n\
+		 start() {{\n\
+		 \t{bin} node boot-restore\n\
+	 }}\n"
+	);
+	swap::sudo_tee(std::path::Path::new("/etc/init.d/llmtune-restore"), &script)?;
+	swap::sudo(&["chmod", "+x", "/etc/init.d/llmtune-restore"])?;
+	swap::sudo(&["rc-update", "add", "llmtune-restore", "bootmisc"])?;
+	Ok("llmtune-restore".to_string())
+}
+
 pub(crate) fn cmd_node_unload(cfg: &Config, sel: Option<&str>, json: bool) -> Result<()> {
 	let node = resolve_target(cfg, sel)?;
 	match node.transport {
-		crate::config::Transport::Local => swap::clear_dropin(&node.llama_unit)?,
+		crate::config::Transport::Local => {
+			let fmt = if crate::init::is_systemd() {
+				swap::DropinFormat::Systemd
+			} else {
+				swap::DropinFormat::OpenRC
+			};
+			swap::clear_dropin(&node.llama_unit, fmt)?
+		}
 		_ => transport::for_node(node)?.unload()?,
 	}
 	if json {
@@ -612,16 +660,29 @@ pub(crate) fn cmd_node_unload(cfg: &Config, sel: Option<&str>, json: bool) -> Re
 	Ok(())
 }
 
-/// `node logs` - tail (or follow) llama-server's own journal on the local
-/// node. `reject_remote` has already confirmed `--node` wasn't a remote
+/// `node logs` - tail (or follow) llama-server's journal on the local
+/// node. systemd: journalctl -u <unit>; OpenRC: tail /var/log/messages.
+/// `reject_remote` has already confirmed `--node` wasn't a remote
 /// selector by the time this runs. There is no `--json` form: this is a live
 /// text stream, not a value.
 pub(crate) fn cmd_node_logs(cfg: &Config, lines: usize, follow: bool) -> Result<()> {
 	let node = cfg.local_node();
-	let status = std::process::Command::new("journalctl")
-		.args(nodeops::logs_argv(&node.llama_unit, lines, follow))
-		.status()
-		.map_err(|e| anyhow::anyhow!("running journalctl (is it installed?): {e}"))?;
+	let status = if crate::init::is_systemd() {
+		std::process::Command::new("journalctl")
+			.args(nodeops::logs_argv(&node.llama_unit, lines, follow))
+			.status()
+			.map_err(|e| anyhow::anyhow!("running journalctl (is it installed?): {e}"))
+		} else {
+			let mut cmd = std::process::Command::new("tail");
+			let mut args = vec!["-n".to_string(), lines.to_string()];
+			if follow {
+				args.push("-F".to_string());
+			}
+			args.push("/var/log/messages".to_string());
+			cmd.args(args).status()
+				.map_err(|e| anyhow::anyhow!("running tail (is it installed?): {e}"))
+		};
+	let status = status?;
 	if !status.success() {
 		std::process::exit(status.code().unwrap_or(1));
 	}

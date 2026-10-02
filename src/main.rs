@@ -31,6 +31,7 @@ mod netboot_node;
 mod netboot_server;
 mod nodeops;
 mod paths;
+mod pkg;
 mod profile;
 mod proxy;
 mod settings;

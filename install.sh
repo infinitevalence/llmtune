@@ -8,8 +8,6 @@
 # Installs one binary (`llmtune`) plus its bundled architecture profiles.
 #
 # Needs: a Rust toolchain (cargo) to build, doas or sudo to install.
-# Alpine: apk add doas (not installed by default).
-# Debian/Ubuntu: sudo (usually pre-installed).
 set -eu
 # pipefail is bash-only; Alpine sh (dash) doesn't support it
 cd "$(dirname "$0")"
@@ -33,15 +31,14 @@ command -v cargo >/dev/null 2>&1 || {
   exit 1
 }
 
-# Detect doas or sudo (Alpine ships doas as a package, not pre-installed)
+# Detect doas or sudo
 if command -v doas >/dev/null 2>&1; then
   PRIVESC=doas
 elif command -v sudo >/dev/null 2>&1; then
   PRIVESC=sudo
 else
   echo "error: doas or sudo required but not found" >&2
-  echo "  Alpine: apk add doas" >&2
-  echo "  Debian/Ubuntu: install sudo" >&2
+  echo "  install doas or sudo via your package manager" >&2
   exit 1
 fi
 

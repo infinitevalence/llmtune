@@ -141,24 +141,25 @@ pub fn load(node: &Node, query: &str) -> Result<(swap::SwapOutcome, bool, bool)>
 	// server isn't wide open). llmtune's own probes send it via llama::auth.
 	// Pass it via a 0600 --api-key-file (NOT --api-key <k>, which would sit in
 	// the drop-in's ExecStart -> /proc/<pid>/cmdline + `systemctl cat`).
+	let fmt = if crate::init::is_systemd() {
+		swap::DropinFormat::Systemd
+	} else {
+		swap::DropinFormat::OpenRC
+	};
 	if let Some(k) = crate::settings::api_key() {
-		let key_path = swap::write_api_key_file(&node.llama_unit, &k)?;
+		let key_path = swap::write_api_key_file(&node.llama_unit, &k, fmt)?;
 		flags = format!("{flags} --api-key-file {key_path}");
 	}
-
-	// Bind host from the exposure setting (localhost by default; 0.0.0.0 exposes
-	// to the LAN). Port stays whatever the node's URL declares. Health/served
-	// probes keep using llama_url (127.0.0.1), which 0.0.0.0 still covers.
 	let (_, port) = parse_bind(&node.llama_url);
 	let opts = swap::SwapOpts {
 		host: crate::settings::bind_host(),
 		port,
 		// Carry the base unit's own env (the netboot image's declarative
 		// gfx1013 Vulkan stack) through the drop-in's Environment= reset.
-		base_env: swap::unit_base_env(&node.llama_unit),
+		base_env: swap::unit_base_env(&node.llama_unit, fmt),
 		..Default::default()
 	};
-	let mut act = if crate::init::is_systemd() {
+	let mut act = if matches!(fmt, swap::DropinFormat::Systemd) {
 	  swap::AnyActuator::Systemd(swap::SystemdActuator::new())
 	} else {
 	  swap::AnyActuator::Openrc(swap::OpenrcActuator::new())
@@ -374,10 +375,20 @@ pub fn bench_streaming(
 	// server is confirmed back up.
 	let bench_marker = BenchPauseMarker::set(&model_name);
 	let unit = &node.llama_unit;
-	swap::sudo(&["systemctl", "stop", unit])?;
+	if crate::init::is_systemd() {
+		swap::sudo(&["systemctl", "stop", unit])?;
+	} else {
+		crate::init::service_stop(unit);
+	}
 	let perf_res = bench::run_llama_bench(&cfg, spec, &tx);
-	let _ = swap::sudo(&["systemctl", "reset-failed", unit]);
-	let restart = swap::sudo(&["systemctl", "start", unit]);
+	if crate::init::is_systemd() {
+		let _ = swap::sudo(&["systemctl", "reset-failed", unit]);
+	}
+	if crate::init::is_systemd() {
+		swap::sudo(&["systemctl", "start", unit])?;
+	} else {
+		crate::init::service_ctl(unit, "start");
+	}
 	// Best-effort: wait for the server to serve again so we don't leave it down.
 	for _ in 0..24 {
 		if llama::health_ok(&node.llama_url) {
@@ -387,7 +398,6 @@ pub fn bench_streaming(
 	}
 	drop(bench_marker); // server is back (or as back as it gets) - clear the pause
 	let perf = perf_res?; // surface a bench failure only after the server is back up
-	restart?;
 
 	// Tag a pooled run with the active cluster (SPEC 5.7), so history and the
 	// leaderboards can distinguish it from single-node throughput. `active` was
@@ -421,7 +431,12 @@ pub fn history(node: &Node, limit: usize) -> Vec<history::Record> {
 /// Remove llmtune's model-select drop-in - the unit reverts to its base config
 /// on the next restart. (Mirror of the CLI `node unload`, for the transport.)
 pub fn unload(node: &Node) -> Result<()> {
-	swap::clear_dropin(&node.llama_unit)?;
+	let fmt = if crate::init::is_systemd() {
+		swap::DropinFormat::Systemd
+	} else {
+		swap::DropinFormat::OpenRC
+	};
+	swap::clear_dropin(&node.llama_unit, fmt)?;
 	// Dropping the drop-in drops `--rpc` with it: the head no longer serves the
 	// pool, so the active-cluster marker must not survive to mis-tag benches.
 	crate::cluster::clear_active();
@@ -432,9 +447,12 @@ pub fn unload(node: &Node) -> Result<()> {
 /// `node server` operation, for the transport. Stopping frees the GPU.
 pub fn server_ctl(node: &Node, action: &str) -> Result<()> {
 	match action {
-		"stop" | "start" | "restart" => swap::sudo(&["systemctl", action, &node.llama_unit]),
-		other => bail!("unknown server action `{other}` (stop|start|restart)"),
+		"stop" | "start" | "restart" => {
+			crate::init::service_ctl(&node.llama_unit, action);
+		}
+		_other => bail!("unknown server action `{action}` (stop|start|restart)"),
 	}
+	Ok(())
 }
 
 /// The `journalctl` argv to tail (or follow) a node's llama-server unit - what
@@ -485,7 +503,11 @@ pub fn boot_restore(node: &Node) -> Result<(bool, bool)> {
 	let loaded = match crate::settings::served_model() {
 		Some(m) => {
 			// Force a re-stage even if the base unit auto-started the same model.
-			let _ = swap::sudo(&["systemctl", "stop", &node.llama_unit]);
+			if crate::init::is_systemd() {
+				let _ = swap::sudo(&["systemctl", "stop", &node.llama_unit]);
+			} else {
+				crate::init::service_stop(&node.llama_unit);
+			}
 			load(node, &m).is_ok()
 		}
 		None => false,
@@ -514,7 +536,11 @@ pub fn boot_restore(node: &Node) -> Result<(bool, bool)> {
 pub fn restage_served(node: &Node) -> bool {
 	match crate::settings::served_model().or_else(|| served(node)) {
 		Some(name) => {
-			let _ = swap::sudo(&["systemctl", "stop", &node.llama_unit]);
+			if crate::init::is_systemd() {
+				let _ = swap::sudo(&["systemctl", "stop", &node.llama_unit]);
+			} else {
+				crate::init::service_stop(&node.llama_unit);
+			}
 			load(node, &name).is_ok()
 		}
 		None => false,

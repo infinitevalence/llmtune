@@ -141,7 +141,7 @@ pub fn spec<'a>(specs: &'a [BuildSpec], name: &str) -> Option<&'a BuildSpec> {
 // ---------------------------------------------------------------------------
 
 /// llmtune's state root - the fixed system home `/var/lib/llmtune` so a user
-/// run and the internal sudo (and models next door) all agree on the path.
+/// run and the elevated build tools (and models next door) all agree on the path.
 /// `LLMTUNE_STATE_DIR` overrides; resolution lives in `paths::shared_state_dir`.
 pub fn state_dir() -> PathBuf {
 	crate::paths::shared_state_dir()
@@ -578,7 +578,7 @@ pub fn current_version(name: &str) -> Option<String> {
 /// The current version dir of build `name` (for `LD_LIBRARY_PATH`), if installed.
 pub fn current_dir(name: &str) -> Option<PathBuf> {
 	let p = name_dir(name).join("current");
-	// Resolve the symlink so the path is stable for systemd.
+	// Resolve the symlink so the path is stable.
 	fs::canonicalize(&p).ok().filter(|p| p.is_dir())
 }
 
@@ -894,31 +894,38 @@ fn distro_id() -> String {
 		.unwrap_or_default()
 }
 
-/// The complete per-distro install command for the Vulkan build toolchain.
-/// Lists ALL required packages (compiler, cmake, git, Vulkan headers + ICD
-/// loader, SPIR-V headers, shader compiler) so a working-but-drifted board that
-/// lost a package to a distro update gets one line to fix it.
+use crate::pkg::detect_pm;
+/// Build the install command for the Vulkan build toolchain.
+/// Each PM always uses the same packages — no distro map needed.
 fn install_cmd() -> String {
-	match distro_id().as_str() {
-		"arch" | "cachyos" | "endeavouros" | "manjaro" | "garuda" | "artix" => {
-			"install: sudo pacman -S --needed base-devel cmake git vulkan-headers \
-			 vulkan-icd-loader spirv-headers shaderc"
-				.into()
+	let pm = detect_pm();
+
+	match pm.as_deref() {
+		Some("pacman") => {
+			const PKGS: &str = "base-devel cmake git vulkan-headers vulkan-icd-loader spirv-headers shaderc";
+			format!("install: pacman -S --needed {PKGS}")
 		}
-		"debian" | "ubuntu" | "pop" | "linuxmint" | "raspbian" => {
-			"install: sudo apt install build-essential cmake git libvulkan-dev \
-			 glslc spirv-headers"
-				.into()
+		Some("apk") => {
+			const PKGS: &str = "gcc g++ cmake git vulkan-headers vulkan-loader-dev spirv-headers shaderc-dev";
+			format!("install: apk add {PKGS}")
 		}
-		"fedora" | "rhel" | "centos" | "rocky" | "almalinux" => {
-			"install: sudo dnf install gcc-c++ cmake git vulkan-headers \
-			 vulkan-loader-devel glslc spirv-headers"
-				.into()
+		Some("apt") => {
+			const PKGS: &str = "build-essential cmake git libvulkan-dev glslc spirv-headers";
+			format!("install: apt install {PKGS}")
 		}
-		_ => "install the Vulkan build toolchain for your distro: a C++ compiler, \
-			  cmake, git, Vulkan headers + ICD loader, SPIR-V headers, and a \
-			  shader compiler (glslc/shaderc)"
-			.into(),
+		Some("dnf") => {
+			const PKGS: &str = "gcc-c++ cmake git vulkan-headers vulkan-loader-devel glslc spirv-headers";
+			format!("install: dnf install {PKGS}")
+		}
+		Some("yum") => {
+			const PKGS: &str = "gcc-c++ cmake git vulkan-headers vulkan-loader-devel glslc spirv-headers";
+			format!("install: yum install {PKGS}")
+		}
+		_ => {
+			format!("install the Vulkan build toolchain for your distro: a C++ compiler, \
+				cmake, git, Vulkan headers + ICD loader, SPIR-V headers, and a \
+				shader compiler (glslc/shaderc)")
+		}
 	}
 }
 

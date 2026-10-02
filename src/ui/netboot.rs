@@ -146,7 +146,7 @@ pub(super) fn fw_summary(backend: Backend, fw: &[(PortRule, Option<bool>)]) -> S
 		s.push_str(&format!(": NOT open {}", closed.join(", ")));
 	}
 	if unknown > 0 {
-		s.push_str(&format!("  ({unknown} unknown - needs sudo)"));
+		s.push_str(&format!("  ({unknown} unknown - needs elevated access)"));
 	}
 	s
 }
