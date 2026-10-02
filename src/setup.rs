@@ -139,23 +139,25 @@ fn current_user() -> String {
 /// hand-written or vendor unit). Supports systemd units and OpenRC init/conf.
 fn existing_unit(unit: &str) -> Option<PathBuf> {
 	let service_name = unit.strip_suffix(".service").unwrap_or(unit);
-	[
-		"/etc/systemd/system",
-		"/run/systemd/system",
-		"/usr/lib/systemd/system",
-		"/lib/systemd/system",
-		"/etc/init.d",
-		"/etc/conf.d",
-	]
-	.iter()
-	.map(|b| {
-		if *b == "/etc/init.d" {
-			Path::new(b).join(service_name)
-		} else {
-			Path::new(b).join(unit)
-		}
-	})
-	.find(|p| p.exists())
+	let paths = vec![
+		crate::platform::user_unit_dir(),
+		PathBuf::from("/etc/systemd/system"),
+		PathBuf::from("/run/systemd/system"),
+		PathBuf::from("/usr/lib/systemd/system"),
+		PathBuf::from("/lib/systemd/system"),
+		PathBuf::from("/etc/init.d"),
+		PathBuf::from("/etc/conf.d"),
+	];
+	paths
+		.into_iter()
+		.map(|b| {
+			if b.ends_with("init.d") {
+				b.join(service_name)
+			} else {
+				b.join(unit)
+			}
+		})
+		.find(|p| p.exists())
 }
 
 fn fleet_path() -> Option<PathBuf> {
@@ -208,12 +210,18 @@ pub fn run(cfg: &Config, opts: &Opts) -> Result<()> {
 	Config::load_str(&cfg_body).context("internal: generated fleet.toml did not parse")?;
 	// /etc on a normal install; /run when /etc's unit dir is read-only (the
 	// NixOS netboot image) - the same root detection `node load` uses.
-	let unit_dir = swap::unit_install_dir();
-	let unit_path = format!("{unit_dir}/{unit}");
-	if unit_dir == swap::RUN_UNIT_DIR {
+	let (unit_path, _unit_dir_str) = if swap::is_root() {
+		let unit_dir = swap::unit_install_dir();
+		(format!("{unit_dir}/{unit}"), unit_dir.to_string())
+	} else {
+		let u = crate::platform::user_unit_dir();
+		(u.join(&unit).to_string_lossy().to_string(), u.to_string_lossy().to_string())
+	};
+	if swap::is_root() && swap::unit_install_dir() == swap::RUN_UNIT_DIR {
 		println!(
 			"[note] /etc/systemd/system is read-only (NixOS image) - units/drop-ins \
-			 go to {unit_dir} (runtime; cleared on reboot)\n"
+			 go to {} (runtime; cleared on reboot)\n",
+			swap::RUN_UNIT_DIR
 		);
 	}
 
@@ -261,9 +269,18 @@ pub fn run(cfg: &Config, opts: &Opts) -> Result<()> {
 					&format!("write base systemd unit {unit} (runs as {user})?"),
 					opts.assume_yes,
 				) {
-					swap::sudo_tee(Path::new(&unit_path), &unit_body)
-						.with_context(|| format!("writing {unit_path}"))?;
-					swap::sudo(&["systemctl", "daemon-reload"])?;
+					if swap::is_root() {
+						swap::sudo_tee(Path::new(&unit_path), &unit_body)
+							.with_context(|| format!("writing {unit_path}"))?;
+						swap::sudo(&["systemctl", "daemon-reload"])?;
+					} else {
+						if let Some(parent) = Path::new(&unit_path).parent() {
+							std::fs::create_dir_all(parent)?;
+						}
+						std::fs::write(&unit_path, &unit_body)
+							.with_context(|| format!("writing {unit_path}"))?;
+						let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+					}
 					println!("[ok]   wrote {unit_path} + daemon-reload");
 				} else {
 					println!("[skip] systemd unit not written - swaps need it to exist");
@@ -275,13 +292,22 @@ pub fn run(cfg: &Config, opts: &Opts) -> Result<()> {
 		// to the same root as the unit (/run on the netboot image).
 		let dropin_d = swap::dropin_dir(&unit);
 		let safe_dropin = dropin_d.join("00-llmtune-safe.conf");
-		swap::sudo(&["mkdir", "-p", &dropin_d.to_string_lossy()])?;
-		swap::sudo_tee(&safe_dropin, SAFE_FALLBACK_DROPIN)
-			.with_context(|| format!("writing {}", safe_dropin.display()))?;
 		let limits_dropin = dropin_d.join("01-llmtune-limits.conf");
-		swap::sudo_tee(&limits_dropin, LIMITS_DROPIN)
-			.with_context(|| format!("writing {}", limits_dropin.display()))?;
-		swap::sudo(&["systemctl", "daemon-reload"])?;
+		if swap::is_root() {
+			swap::sudo(&["mkdir", "-p", &dropin_d.to_string_lossy()])?;
+			swap::sudo_tee(&safe_dropin, SAFE_FALLBACK_DROPIN)
+				.with_context(|| format!("writing {}", safe_dropin.display()))?;
+			swap::sudo_tee(&limits_dropin, LIMITS_DROPIN)
+				.with_context(|| format!("writing {}", limits_dropin.display()))?;
+			swap::sudo(&["systemctl", "daemon-reload"])?;
+		} else {
+			std::fs::create_dir_all(&dropin_d)?;
+			std::fs::write(&safe_dropin, SAFE_FALLBACK_DROPIN)
+				.with_context(|| format!("writing {}", safe_dropin.display()))?;
+			std::fs::write(&limits_dropin, LIMITS_DROPIN)
+				.with_context(|| format!("writing {}", limits_dropin.display()))?;
+			let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+		}
 		println!("[ok]   safe fallback + crash-loop guard drop-ins ensured");
 	} else {
 		let service_name = unit.strip_suffix(".service").unwrap_or(&unit);

@@ -11,7 +11,7 @@ pub const ETC_UNIT_DIR: &str = "/etc/systemd/system";
 pub const RUN_UNIT_DIR: &str = "/run/systemd/system";
 const VENDOR_UNIT_DIRS: &[&str] = &["/usr/lib/systemd/system", "/lib/systemd/system"];
 
-fn user_unit_dir() -> PathBuf {
+pub fn user_unit_dir() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

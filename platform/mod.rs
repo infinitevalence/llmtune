@@ -21,9 +21,9 @@ mod memory;
 
 // Init system detection + actuators
 pub mod init;
-mod systemd;
+pub mod systemd;
 mod openrc;
-pub use systemd::SystemdActuator;
+pub use systemd::{SystemdActuator, user_unit_dir};
 pub use openrc::OpenrcActuator;
 
 // Unix platform hooks (compile-time: Linux/Unix only)
