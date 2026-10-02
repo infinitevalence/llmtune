@@ -122,6 +122,13 @@ pub fn load(node: &Node, query: &str) -> Result<(swap::SwapOutcome, bool, bool)>
 	let _guard = lock::LockGuard::gpu()
 		.map_err(|_| anyhow::anyhow!("the GPU is busy (a swap or benchmark is already running on this node) - refusing to swap"))?;
 
+	if crate::setup::existing_unit(&node.llama_unit).is_none() {
+		bail!(
+			"base unit `{}` does not exist — run `llmtune setup` first",
+			node.llama_unit
+		);
+	}
+
 	let m = resolve_model(node, query)?;
 	if !model::is_chat_model(&m.name) {
 		bail!(

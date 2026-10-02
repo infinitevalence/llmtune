@@ -33,7 +33,6 @@ impl Transport {
 /// an arbitrary-path write.
 fn valid_unit_name(s: &str) -> bool {
 	!s.is_empty()
-		&& s.ends_with(".service")
 		&& !s.contains('/')
 		&& !s.contains("..")
 		&& s.chars()
@@ -642,7 +641,7 @@ impl Config {
 			if !valid_unit_name(&llama_unit) {
 				bail!(
 					"node '{}': invalid llama_unit '{llama_unit}' \
-					 (must be a unit name ending in .service, no '/' or '..')",
+					 (must be a valid unit/service name, no '/' or '..')",
 					n.name
 				);
 			}
@@ -669,7 +668,7 @@ impl Config {
 
 		if nodes.is_empty() {
 			if !valid_unit_name(&def_unit) {
-				bail!("invalid default llama_unit '{def_unit}' (must end in .service, no '/' or '..')");
+				bail!("invalid default llama_unit '{def_unit}' (must be a valid unit/service name, no '/' or '..')");
 			}
 			nodes.push(Node {
 				name: "localhost".to_string(),
@@ -945,12 +944,12 @@ mod tests {
 	#[test]
 	fn invalid_unit_name_rejected() {
 		assert!(valid_unit_name("llama-server.service"));
+		assert!(valid_unit_name("llama-server"));
 		assert!(valid_unit_name("llama@bc250.service"));
-		assert!(!valid_unit_name("../etc/evil.service"));
-		assert!(!valid_unit_name("foo/bar.service"));
-		assert!(!valid_unit_name("noext"));
+		assert!(!valid_unit_name("../etc/evil"));
+		assert!(!valid_unit_name("foo/bar"));
 		let err =
-			Config::load_str("[[node]]\nname=\"a\"\nllama_unit=\"../x.service\"\n").unwrap_err();
+			Config::load_str("[[node]]\nname=\"a\"\nllama_unit=\"../x\"\n").unwrap_err();
 		assert!(err.to_string().contains("invalid llama_unit"));
 	}
 }

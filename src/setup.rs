@@ -137,7 +137,7 @@ fn current_user() -> String {
 
 /// Where an existing unit named `unit` lives, if any (so setup never clobbers a
 /// hand-written or vendor unit). Supports systemd units and OpenRC init/conf.
-fn existing_unit(unit: &str) -> Option<PathBuf> {
+pub(crate) fn existing_unit(unit: &str) -> Option<PathBuf> {
 	let service_name = unit.strip_suffix(".service").unwrap_or(unit);
 	let paths = vec![
 		crate::platform::user_unit_dir(),
