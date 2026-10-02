@@ -59,8 +59,10 @@ pub fn unit_text(user: &str) -> String {
 		 WantedBy=multi-user.target\n"
 	)
 }
-
 /// OpenRC init script template for llama-server.
+/// command="/bin/false" is a systemd-legacy placeholder - llmtune's per-model
+/// swap overwrites it via /etc/conf.d/llama-server (command="<real-path>").
+/// output/input redirect stdout/stderr to /var/log/openrc/llama-server.log.
 pub fn openrc_init_text(user: &str) -> String {
 	format!(
 		"#!/sbin/openrc-run\n\
@@ -69,6 +71,8 @@ pub fn openrc_init_text(user: &str) -> String {
 		 command=\"/bin/false\"\n\
 		 command_user=\"{user}\"\n\
 		 supervisor=\"supervise-daemon\"\n\
+		 output=\"/var/log/openrc/llama-server.log\"\n\
+		 input=\"/dev/null\"\n\
 		 \n\
 		 depend() {{\n\
 		 \tafter net\n\

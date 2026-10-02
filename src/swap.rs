@@ -178,7 +178,13 @@ pub fn render_dropin(
 			s.push_str("ExecStart=\n");
 		}
 		DropinFormat::OpenRC => {
-			// OpenRC: `command_args` is appended to the init script's command.
+			// The OpenRC init script has command="/bin/false" in its template;
+			// this overrides it so the real binary runs instead, with command_args
+			// appended. The systemd drop-in replaces ExecStart directly.
+			s.push_str(&format!(
+				"command=\"{}\"\n",
+				bin,
+			));
 		}
 	}
 	// Quote the binary + model path so a space in either can't split the argv
@@ -950,23 +956,22 @@ fn init_root_method() {
 
 /// Detect whether `doas` or `sudo` is available on PATH.
 fn detect_root_method() -> RootMethod {
-	// doas silently exits 0 with no stdout on -h
-	let has_doas = Command::new("doas")
-		.args(["-h"])
-		.output()
-		.map(|o| o.stdout.is_empty())
-		.ok();
+	// Prefer doas if present (standard on Alpine), else sudo.
+	let has_doas = Command::new("which")
+		.arg("doas")
+		.status()
+		.map(|s| s.success())
+		.unwrap_or(false);
 
-	// sudo silently exits 0 (but doesn't run the command) on -n
 	let has_sudo = Command::new("sudo")
 		.args(["-n", "true"])
 		.output()
 		.map(|o| o.status.success())
-		.ok();
+		.unwrap_or(false);
 
-	if has_doas.unwrap_or(false) {
+	if has_doas {
 		RootMethod::Doas
-	} else if has_sudo.unwrap_or(false) {
+	} else if has_sudo {
 		RootMethod::Sudo
 	} else {
 		RootMethod::Sudo
@@ -1032,17 +1037,17 @@ pub(crate) fn sudo(args: &[&str]) -> Result<()> {
 	let (prog, rest) = privileged_argv(args, is_root());
 	let noninteractive = !is_root() && must_be_noninteractive(tui_active());
 	let mut cmd = Command::new(prog);
-	if noninteractive {
+	// Only sudo supports -n; doas does not have a non-interactive flag.
+	if noninteractive && prog == "sudo" {
 		cmd.arg("-n");
 	}
 	let out = cmd.args(rest).output()?;
 	if !out.status.success() {
 		if noninteractive {
 			bail!(
-				"this needs a sudo password, but the interactive TUI can't safely prompt for one \
+				"this needs an elevation password, but the interactive TUI can't safely prompt for one \
 				 (the prompt would write straight to the terminal ratatui is drawing to, with no \
-				 way to type an answer) - run `sudo -v` in another terminal first (caches it for a \
-				 while), or add a NOPASSWD sudoers rule for llmtune's systemctl calls, then retry"
+				 way to type an answer) - run `sudo -v` or authenticate in another terminal first, then retry"
 			);
 		}
 		bail!(sudo_failure_message(prog, rest, out.status, &out.stderr));
