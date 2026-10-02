@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! OpenRC actuator implementation.
+//!
+//! Implementation moved from src/swap.rs. Uses helper functions from crate::swap.
+
+use crate::platform::{Actuator, DropinFormat};
+use anyhow::Result;
+use std::path::PathBuf;
+use std::process::Command;
+use crate::swap::{is_root, root_cmd, sudo, sudo_tee_secret};
+
+/// OpenRC-specific Actuator implementation.
+///
+/// Holds the prior conf.d content across stage() → commit()/rollback().
+pub struct OpenrcActuator {
+    /// The conf file content we wrote this stage (restored on rollback).
+    wrote: Option<String>,
+    /// Previous content of `/etc/conf.d/{unit}`, restored on rollback.
+    prev: Option<String>,
+}
+
+impl OpenrcActuator {
+    pub fn new() -> Self {
+        OpenrcActuator {
+            wrote: None,
+            prev: None,
+        }
+    }
+}
+
+impl Default for OpenrcActuator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Actuator for OpenrcActuator {
+    fn stage(&mut self, unit: &str, dropin_content: &str, _fmt: DropinFormat) -> Result<()> {
+        let conf = PathBuf::from(format!("/etc/conf.d/{unit}"));
+        // Read previous content for rollback.
+        self.prev = if is_root() {
+            std::fs::read_to_string(&conf).ok()
+        } else {
+            Command::new(root_cmd())
+                .args(["cat", &conf.to_string_lossy()])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        };
+        self.wrote = Some(dropin_content.to_string());
+        sudo_tee_secret(&conf, dropin_content)
+    }
+
+    fn rollback(&mut self, unit: &str) -> Result<()> {
+        if let Some(prev) = self.prev.take() {
+            let p = PathBuf::from(format!("/etc/conf.d/{unit}"));
+            sudo_tee_secret(&p, &prev)?;
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        // Keep our conf file; prev is dropped.
+        Ok(())
+    }
+
+    fn restart(&mut self, unit: &str) -> Result<()> {
+        sudo(&["rc-service", unit, "restart"])?;
+        Ok(())
+    }
+}

@@ -27,12 +27,9 @@ pub struct SwapOutcome {
 	pub detail: String,
 }
 
-/// Drop-in format for the target init system.
-#[derive(Debug, Clone, Copy)]
-pub enum DropinFormat {
-	Systemd,
-	OpenRC,
-}
+pub use crate::platform::DropinFormat;
+pub use crate::platform::Actuator;
+pub use crate::platform::init::set_tui_active;
 
 /// Knobs for a swap.
 #[derive(Debug, Clone)]
@@ -65,26 +62,19 @@ impl Default for SwapOpts {
 	}
 }
 
-/// Reconfigures and bounces the llama service. `stage` saves the prior config so
-/// `rollback` can restore it exactly; `commit` discards the saved prior on success.
-pub trait Actuator {
-	fn stage(&mut self, unit: &str, dropin: &str) -> Result<()>;
-	fn rollback(&mut self, unit: &str) -> Result<()>;
-	fn commit(&mut self) -> Result<()>;
-	fn reload_restart(&mut self, unit: &str) -> Result<()>;
-}
+// Reconfigures and bounces the llama service.
 
 /// Either systemd or OpenRC actuator — pick at init detection time.
 pub enum AnyActuator {
-	Systemd(SystemdActuator),
-	Openrc(OpenrcActuator),
+	Systemd(crate::platform::SystemdActuator),
+	Openrc(crate::platform::OpenrcActuator),
 }
 
 impl Actuator for AnyActuator {
-	fn stage(&mut self, unit: &str, dropin: &str) -> Result<()> {
+	fn stage(&mut self, unit: &str, dropin: &str, fmt: DropinFormat) -> Result<()> {
 		match self {
-			AnyActuator::Systemd(a) => a.stage(unit, dropin),
-			AnyActuator::Openrc(a) => a.stage(unit, dropin),
+			AnyActuator::Systemd(a) => a.stage(unit, dropin, fmt),
+			AnyActuator::Openrc(a) => a.stage(unit, dropin, fmt),
 		}
 	}
 	fn rollback(&mut self, unit: &str) -> Result<()> {
@@ -99,10 +89,10 @@ impl Actuator for AnyActuator {
 			AnyActuator::Openrc(a) => a.commit(),
 		}
 	}
-	fn reload_restart(&mut self, unit: &str) -> Result<()> {
+	fn restart(&mut self, unit: &str) -> Result<()> {
 		match self {
-			AnyActuator::Systemd(a) => a.reload_restart(unit),
-			AnyActuator::Openrc(a) => a.reload_restart(unit),
+			AnyActuator::Systemd(a) => a.restart(unit),
+			AnyActuator::Openrc(a) => a.restart(unit),
 		}
 	}
 }
@@ -488,7 +478,7 @@ pub fn swap<A: Actuator, H: Health>(
 	// drop-in has already been removed/replaced, so roll back before returning -
 	// otherwise a systemctl failure strands the node with a bad (or no) config.
 	if let Err(e) = act
-		.stage(unit, &dropin)
+		.stage(unit, &dropin, opts.fmt)
 		.and_then(|()| act.reload_restart(unit))
 	{
 		// Report whether the revert actually succeeded - don't claim "reverted"
@@ -920,407 +910,8 @@ fn winning_name(foreign: &[String]) -> String {
 	}
 }
 
-/// Whether this process already runs as root (euid 0). The netboot image has
-/// no sudo binary, so privileged ops must run directly there; `setup`/`doctor`
-/// and every `sudo`/`sudo_tee` call share this one detection.
-pub(crate) fn is_root() -> bool {
-	// SAFETY: geteuid can't fail and touches no memory.
-	unsafe { libc::geteuid() == 0 }
-}
-
-/// The privileged argv: run `args` directly when already root (no sudo on the
-/// netboot image), via `sudo` otherwise. Pure (unit-tested).
-fn privileged_argv<'a>(args: &'a [&'a str], root: bool) -> (&'a str, &'a [&'a str]) {
-	if root {
-		(args[0], &args[1..])
-	} else {
-		(root_cmd(), args)
-	}
-}
-
-/// Either `sudo` or `doas` - detected once at startup.
-#[derive(Clone, Copy)]
-enum RootMethod {
-	Sudo,
-	Doas,
-}
-
-/// Thread-safe singleton: detected root-elevation method.
-static ROOT_METHOD: std::sync::OnceLock<RootMethod> = std::sync::OnceLock::new();
-
-/// Initialize root method at first use.
-fn init_root_method() {
-	let method = detect_root_method();
-	ROOT_METHOD.get_or_init(|| method);
-}
-
-/// Detect whether `doas` or `sudo` is available on PATH.
-fn detect_root_method() -> RootMethod {
-	// Prefer doas if present (standard on Alpine), else sudo.
-	let has_doas = Command::new("which")
-		.arg("doas")
-		.status()
-		.map(|s| s.success())
-		.unwrap_or(false);
-
-	let has_sudo = Command::new("sudo")
-		.args(["-n", "true"])
-		.output()
-		.map(|o| o.status.success())
-		.unwrap_or(false);
-
-	if has_doas {
-		RootMethod::Doas
-	} else if has_sudo {
-		RootMethod::Sudo
-	} else {
-		RootMethod::Sudo
-	}
-}
-
-/// Return the root-elevation binary detected at startup.
-pub(crate) fn root_cmd() -> &'static str {
-	init_root_method();
-	match ROOT_METHOD.get().copied() {
-		Some(RootMethod::Sudo) => "sudo",
-		Some(RootMethod::Doas) => "doas",
-		None => "sudo",
-	}
-}
-
-static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn set_tui_active(active: bool) {
-	TUI_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
-}
-
-fn tui_active() -> bool {
-	TUI_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// True when `sudo` should never be allowed to prompt on THIS call: the TUI
-/// owns the terminal, so a prompt has nowhere safe to go (see `TUI_ACTIVE`).
-/// Pure (unit-tested) - the actual non-interactivity is enforced atomically
-/// by passing `-n` on the SAME invocation that runs the real command (below),
-/// not by a separate check-then-call probe: an earlier version ran `sudo -n
-/// true` first and, if that succeeded, ran the real command without `-n`,
-/// trusting the credential was still cached a moment later - a real
-/// TOCTOU gap, and exactly the failure mode reported live in aibc250
-/// (Scent, 2026-09-14) after the first fix shipped: the prompt still got
-/// through. `-n` on the one call sudo actually runs makes a prompt
-/// impossible regardless of timing.
-fn must_be_noninteractive(tui_active: bool) -> bool {
-	tui_active
-}
-
-/// Run a privileged command: directly when already root, via sudo otherwise.
-/// (Kept under its historical name - every privileged call site routes here.)
-/// Captures stdout+stderr rather than inheriting them: a failing systemctl
-/// (e.g. `reset-failed`/`restart` against a unit that was never
-/// installed/enabled) writes its OWN colored error straight to whatever
-/// terminal it inherits - while the TUI has that terminal in
-/// alternate-screen/raw mode, an inherited stderr write lands directly on
-/// the ratatui-drawn screen, outside any widget's bounds, corrupting the
-/// display (reported live in aibc250, Danii, 2026-09-14: "a red error
-/// corrupting the TUI"). Capturing it folds the message into the normal
-/// `Result` error path instead, so it renders through llmtune's own error
-/// display like every other failure. While the interactive TUI owns the
-/// terminal, the call runs with `-n` (see `must_be_noninteractive`) so a
-/// password prompt - which bypasses stdout/stderr entirely, straight to
-/// `/dev/tty` - is never even attempted; sudo fails immediately instead,
-/// with a message that says a password is needed, instead of writing an
-/// unusable prompt onto the TUI's screen.
-pub(crate) fn sudo(args: &[&str]) -> Result<()> {
-	if args.is_empty() {
-		bail!("privileged exec called with an empty argv");
-	}
-	let (prog, rest) = privileged_argv(args, is_root());
-	let noninteractive = !is_root() && must_be_noninteractive(tui_active());
-	let mut cmd = Command::new(prog);
-	// Only sudo supports -n; doas does not have a non-interactive flag.
-	if noninteractive && prog == "sudo" {
-		cmd.arg("-n");
-	}
-	let out = cmd.args(rest).output()?;
-	if !out.status.success() {
-		if noninteractive {
-			bail!(
-				"this needs an elevation password, but the interactive TUI can't safely prompt for one \
-				 (the prompt would write straight to the terminal ratatui is drawing to, with no \
-				 way to type an answer) - run `sudo -v` or authenticate in another terminal first, then retry"
-			);
-		}
-		bail!(sudo_failure_message(prog, rest, out.status, &out.stderr));
-	}
-	Ok(())
-}
-
-/// Pure formatter for a failed privileged command - separated from `sudo` so
-/// the message shape unit-tests without a real subprocess. Falls back to the
-/// bare exit status when stderr is empty/non-UTF8 (some failures, e.g. sudo
-/// itself refusing, print nothing there).
-fn sudo_failure_message(
-	prog: &str,
-	rest: &[&str],
-	status: std::process::ExitStatus,
-	stderr: &[u8],
-) -> String {
-	let msg = String::from_utf8_lossy(stderr);
-	let msg = msg.trim();
-	if msg.is_empty() {
-		format!("{prog} {rest:?} failed ({status})")
-	} else {
-		format!("{prog} {rest:?} failed ({status}): {msg}")
-	}
-}
-
-/// The user a unit runs as. For systemd units this is the `User=` directive;
-/// for OpenRC units it is `RC_USER` from the `/etc/conf.d/<unit>` file.
-fn unit_user(unit: &str, fmt: DropinFormat) -> String {
-	match fmt {
-		DropinFormat::Systemd => unit_user_systemd(unit),
-		DropinFormat::OpenRC => openrc_unit_user(unit),
-	}
-}
-
-/// The user a systemd unit runs as (`User=`), or "root" if unset/unknown.
-fn unit_user_systemd(unit: &str) -> String {
-	Command::new("systemctl")
-		.args(["show", "-p", "User", "--value", unit])
-		.output()
-		.ok()
-		.and_then(|o| String::from_utf8(o.stdout).ok())
-		.map(|s| s.trim().to_string())
-		.filter(|s| !s.is_empty())
-		.unwrap_or_else(|| "root".to_string())
-}
-
-/// The user an OpenRC unit runs as, or "root" if unset/unknown.
-/// Reads `/etc/conf.d/<unit>` and extracts `RC_USER=...`.
-fn openrc_unit_user(unit: &str) -> String {
-	let conf = PathBuf::from(format!("/etc/conf.d/{unit}"));
-	let content = if is_root() {
-		std::fs::read_to_string(&conf).unwrap_or_default()
-	} else {
-		Command::new(root_cmd())
-			.args(["cat", &conf.to_string_lossy()])
-			.output()
-			.ok()
-			.and_then(|o| String::from_utf8(o.stdout).ok())
-			.unwrap_or_default()
-	};
-	content
-		.lines()
-		.find(|l| l.starts_with("RC_USER="))
-		.and_then(|l| l.strip_prefix("RC_USER="))
-		.map(|s| s.trim().to_string())
-		.filter(|s| !s.is_empty())
-		.unwrap_or_else(|| "root".to_string())
-}
-
-/// Write `key` to a 0600 file owned by the unit's service user and return its
-/// path, so the server can be launched with `--api-key-file <path>` instead of
-/// `--api-key <k>`. The key goes to the file via stdin (never argv), the file is
-/// 0600 (created that way, no world-readable window), and it is chowned to the
-/// user llama-server runs as so it can read it. Returns the path.
-pub(crate) fn write_api_key_file(unit: &str, key: &str, fmt: DropinFormat) -> Result<String> {
-	let path = crate::paths::shared_state_dir().join("api-key");
-	let path_s = path.to_string_lossy().to_string();
-	let user = unit_user(unit, fmt);
-	if let Some(parent) = path.parent() {
-		sudo(&["mkdir", "-p", &parent.to_string_lossy()])?;
-	}
-	// 0600 root-owned, key piped via stdin (sudo_tee_secret), then hand it to the
-	// service user so the launched llama-server can read it.
-	sudo_tee_secret(&path, key)?;
-	sudo(&["chown", "--", &user, &path_s])?;
-	Ok(path_s)
-}
-
-pub(crate) fn sudo_tee(path: &Path, content: &str) -> Result<()> {
-	// Same root detection as `sudo`: run `tee` directly when already root.
-	let mut cmd = if is_root() {
-		Command::new("tee")
-	} else {
-		let mut c = Command::new(root_cmd());
-		c.arg("tee");
-		c
-	};
-	let mut child = cmd
-		.arg(path)
-		.stdin(Stdio::piped())
-		.stdout(Stdio::null())
-		.spawn()?;
-	child
-		.stdin
-		.take()
-		.expect("stdin piped")
-		.write_all(content.as_bytes())?;
-	let st = child.wait()?;
-	if !st.success() {
-		bail!("tee {} failed ({st})", path.display());
-	}
-	Ok(())
-}
-
-/// `sudo_tee` then tighten the file to owner-only (0600). The drop-in and its
-/// backup carry the api key in `ExecStart`; `tee` creates them world-readable
-/// (root umask), so any local user could read the key. systemd reads drop-ins as
-/// root, so 0600 does not affect it.
-pub(crate) fn sudo_tee_secret(path: &Path, content: &str) -> Result<()> {
-	// Pre-create the file 0600 (tee truncates+writes but never widens the mode),
-	// so the api-key-bearing drop-in is never world-readable for a window between
-	// a `tee` and a follow-up `chmod`. The path is always an absolute,
-	// llmtune-constructed drop-in/backup path (no leading '-').
-	sudo(&["install", "-m", "600", "/dev/null", &path.to_string_lossy()])?;
-	sudo_tee(path, content)
-}
-
-/// Actuator that drives a real systemd-managed llama-server via a drop-in. It
-/// writes a drop-in whose filename sorts last (so its `ExecStart` wins over any
-/// competing drop-in, e.g. another model-manager's), removing stale llmtune
-/// drop-ins first and restoring them on rollback.
-pub struct SystemdActuator {
-	/// The drop-in we wrote this stage (removed on rollback).
-	wrote: Option<PathBuf>,
-	/// A prior llmtune drop-in we removed (path, content), restored on rollback.
-	removed_self: Option<(PathBuf, String)>,
-	backup_dir: PathBuf,
-}
-
-impl SystemdActuator {
-	pub fn new() -> Self {
-		SystemdActuator {
-			wrote: None,
-			removed_self: None,
-			backup_dir: PathBuf::from("/var/lib/llmtune/backups"),
-		}
-	}
-}
-
-impl Default for SystemdActuator {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl Actuator for SystemdActuator {
-	fn stage(&mut self, unit: &str, dropin: &str) -> Result<()> {
-		let dir = dropin_dir(unit);
-		// Union scan across ALL drop-in roots: stale llmtune drop-ins in any
-		// writable root are removed, and foreign names from every root feed
-		// winning_name() - so the staged file can't be shadowed by an override
-		// in another root (e.g. the netboot image's bc250-swap conf in /run).
-		let (ours, foreign) = collect_dropins(unit);
-		// Remove any existing llmtune drop-ins; back up the first to restore on rollback.
-		for (i, p) in ours.iter().enumerate() {
-			if i == 0 {
-				let content = read_dropin(p);
-				let _ = sudo(&["mkdir", "-p", &self.backup_dir.to_string_lossy()]);
-				let _ = sudo_tee_secret(
-					&self.backup_dir.join(format!("{unit}.dropin.prev")),
-					&content,
-				);
-				self.removed_self = Some((p.clone(), content));
-			}
-			let _ = sudo(&["rm", "-f", &p.to_string_lossy()]);
-		}
-		let path = dir.join(winning_name(&foreign));
-		sudo(&["mkdir", "-p", &dir.to_string_lossy()])?;
-		sudo_tee_secret(&path, dropin)?;
-		self.wrote = Some(path);
-		Ok(())
-	}
-
-	fn rollback(&mut self, _unit: &str) -> Result<()> {
-		if let Some(p) = self.wrote.take() {
-			sudo(&["rm", "-f", &p.to_string_lossy()])?;
-		}
-		if let Some((p, c)) = self.removed_self.take() {
-			sudo_tee_secret(&p, &c)?;
-		}
-		Ok(())
-	}
-
-	fn commit(&mut self) -> Result<()> {
-		// Keep our drop-in; the removed foreign-vs-self state is now permanent.
-		self.removed_self = None;
-		Ok(())
-	}
-
-	fn reload_restart(&mut self, unit: &str) -> Result<()> {
-		sudo(&["systemctl", "daemon-reload"])?;
-		// Clear any latched start-limit BEFORE restarting. Without this, a prior
-		// crash-loop that tripped the guard (4 fails/120s) leaves the unit in a
-		// start-limit-hit state where `systemctl restart` is REFUSED - so the
-		// auto-revert below would fail to bring the previous good model back and
-		// the box would sit with nothing served until a human ran reset-failed.
-		// reset-failed on a healthy unit is a harmless no-op.
-		let _ = sudo(&["systemctl", "reset-failed", unit]);
-		sudo(&["systemctl", "restart", unit])?;
-		Ok(())
-	}
-}
-
-/// Actuator that drives a real OpenRC-managed llama-server via `/etc/conf.d/`.
-/// Writes the conf file and uses `rc-service` to restart.
-pub struct OpenrcActuator {
-	/// The conf file content we wrote this stage (restored on rollback).
-	wrote: Option<String>,
-	/// Previous content of `/etc/conf.d/llama-server`, restored on rollback.
-	prev: Option<String>,
-}
-
-impl OpenrcActuator {
-	pub fn new() -> Self {
-		OpenrcActuator {
-			wrote: None,
-			prev: None,
-		}
-	}
-}
-
-impl Default for OpenrcActuator {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl Actuator for OpenrcActuator {
-	fn stage(&mut self, unit: &str, dropin: &str) -> Result<()> {
-		let conf = PathBuf::from(format!("/etc/conf.d/{unit}"));
-		// Read previous content for rollback.
-		self.prev = if is_root() {
-			std::fs::read_to_string(&conf).ok()
-		} else {
-			Command::new(root_cmd())
-				.args(["cat", &conf.to_string_lossy()])
-				.output()
-				.ok()
-				.and_then(|o| String::from_utf8(o.stdout).ok())
-		};
-		self.wrote = Some(dropin.to_string());
-		sudo_tee_secret(&conf, dropin)
-	}
-
-	fn rollback(&mut self, _unit: &str) -> Result<()> {
-		if let Some(prev) = self.prev.take() {
-			let p = PathBuf::from("/etc/conf.d/llama-server");
-			sudo_tee_secret(&p, &prev)?;
-		}
-		Ok(())
-	}
-
-	fn commit(&mut self) -> Result<()> {
-		// Keep our conf file; prev is dropped.
-		Ok(())
-	}
-
-	fn reload_restart(&mut self, unit: &str) -> Result<()> {
-		sudo(&["rc-service", unit, "restart"])?;
-		Ok(())
-	}
-}
+pub use crate::platform::init::{is_root, root_cmd, sudo, sudo_tee, sudo_tee_secret, write_api_key_file};
+pub use crate::platform::{SystemdActuator, OpenrcActuator};
 
 /// Health probe backed by a live llama-server HTTP endpoint.
 pub struct HttpHealth {
@@ -1342,6 +933,7 @@ impl Health for HttpHealth {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::platform::init::{privileged_argv, ROOT_METHOD, RootMethod, must_be_noninteractive, sudo_failure_message};
 	use crate::profile;
 	use std::cell::{Cell, RefCell};
 
@@ -1578,7 +1170,7 @@ mod tests {
 		}
 	}
 	impl Actuator for MockActuator {
-		fn stage(&mut self, _u: &str, _d: &str) -> Result<()> {
+		fn stage(&mut self, _u: &str, _d: &str, _fmt: DropinFormat) -> Result<()> {
 			self.log.borrow_mut().push("stage".into());
 			Ok(())
 		}
@@ -1592,7 +1184,7 @@ mod tests {
 			self.log.borrow_mut().push("commit".into());
 			Ok(())
 		}
-		fn reload_restart(&mut self, _u: &str) -> Result<()> {
+		fn restart(&mut self, _u: &str) -> Result<()> {
 			let n = self.reloads.get();
 			self.reloads.set(n + 1);
 			self.log.borrow_mut().push("reload_restart".into());

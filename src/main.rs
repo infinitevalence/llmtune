@@ -40,6 +40,8 @@ mod swap;
 mod telemetry;
 mod transport;
 mod ui;
+#[path = "../platform/mod.rs"]
+mod platform;
 
 fn main() {
 	// Die quietly on a closed pipe (`llmtune --json ... | head`) instead of

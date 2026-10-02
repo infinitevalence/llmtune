@@ -11,15 +11,23 @@ static IS_SYSTEMD: OnceLock<bool> = OnceLock::new();
 
 /// Detect the init system once, caching the result.
 ///
-/// Runs `systemctl --version`: success → systemd, failure → OpenRC.
+/// Runs `systemctl --version`: success → systemd.
+/// Fallback: checks OpenRC signatures ( `/run/openrc` pid or `/etc/init.d/` dir).
+/// This double-check prevents Alpine (which has no systemd) from being
+/// misclassified if `systemctl` binary exists (broken symlink, NixOS stub, etc.)
+/// but OpenRC is actually the running init.
 pub fn is_systemd() -> bool {
 	*IS_SYSTEMD.get_or_init(|| {
-		let ok = std::process::Command::new("systemctl")
+		let systemctl = std::process::Command::new("systemctl")
 			.arg("--version")
 			.output()
 			.map(|o| o.status.success())
 			.unwrap_or(false);
-		ok
+		// systemctl succeeded? systemd.
+		if systemctl { return true; }
+		// Fallback: OpenRC presence.
+		std::path::Path::new("/run/openrc").exists()
+			|| std::path::Path::new("/etc/init.d").is_dir()
 	})
 }
 

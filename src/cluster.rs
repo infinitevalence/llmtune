@@ -150,6 +150,11 @@ pub fn up<W: WorkerCtl, A: swap::Actuator, H: swap::Health>(
 		.collect();
 	let flags = inject_rpc(&swap::adjust_flags(head_profile, head_model), &endpoints);
 	let (head_bin, head_ld) = head_profile.launch();
+	let fmt = if crate::init::is_systemd() {
+		swap::DropinFormat::Systemd
+	} else {
+		swap::DropinFormat::OpenRC
+	};
 	let dropin = swap::render_dropin(
 		head_profile,
 		&head_bin,
@@ -159,16 +164,12 @@ pub fn up<W: WorkerCtl, A: swap::Actuator, H: swap::Health>(
 		&opts.host,
 		opts.port,
 		&opts.base_env,
-			  if crate::init::is_systemd() {
-				  swap::DropinFormat::Systemd
-			} else {
-				  swap::DropinFormat::OpenRC
-			},
+		fmt,
 	);
 	// A stage/restart ERROR (not just an unhealthy head) must still stop the
 	// workers already running, or `?` leaks live rpc-servers across the rack.
 	if let Err(e) = head_act
-		.stage(head_unit, &dropin)
+		.stage(head_unit, &dropin, fmt)
 		.and_then(|()| head_act.reload_restart(head_unit))
 	{
 		teardown_warn(wctl, workers, rpc_port);
@@ -614,7 +615,7 @@ mod tests {
 		rolled_back: Cell<bool>,
 	}
 	impl swap::Actuator for MockAct {
-		fn stage(&mut self, _u: &str, _d: &str) -> Result<()> {
+		fn stage(&mut self, _u: &str, _d: &str, _fmt: swap::DropinFormat) -> Result<()> {
 			Ok(())
 		}
 		fn rollback(&mut self, _u: &str) -> Result<()> {
@@ -625,7 +626,7 @@ mod tests {
 			self.committed.set(true);
 			Ok(())
 		}
-		fn reload_restart(&mut self, _u: &str) -> Result<()> {
+		fn restart(&mut self, _u: &str) -> Result<()> {
 			Ok(())
 		}
 	}
@@ -834,7 +835,7 @@ mod tests {
 		// not leak running rpc-servers on the workers.
 		struct FailingStage;
 		impl swap::Actuator for FailingStage {
-			fn stage(&mut self, _u: &str, _d: &str) -> Result<()> {
+			fn stage(&mut self, _u: &str, _d: &str, _fmt: swap::DropinFormat) -> Result<()> {
 				bail!("disk full")
 			}
 			fn rollback(&mut self, _u: &str) -> Result<()> {
@@ -843,7 +844,7 @@ mod tests {
 			fn commit(&mut self) -> Result<()> {
 				Ok(())
 			}
-			fn reload_restart(&mut self, _u: &str) -> Result<()> {
+			fn restart(&mut self, _u: &str) -> Result<()> {
 				Ok(())
 			}
 		}
