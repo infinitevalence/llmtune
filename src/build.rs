@@ -882,18 +882,6 @@ fn dep_in_path(cmd: &str) -> bool {
 		.unwrap_or(false)
 }
 
-fn distro_id() -> String {
-	fs::read_to_string("/etc/os-release")
-		.ok()
-		.and_then(|s| {
-			s.lines().find_map(|l| {
-				l.strip_prefix("ID=")
-					.map(|v| v.trim_matches('"').to_string())
-			})
-		})
-		.unwrap_or_default()
-}
-
 use crate::pkg::detect_pm;
 /// Build the install command for the Vulkan build toolchain.
 /// Each PM always uses the same packages — no distro map needed.

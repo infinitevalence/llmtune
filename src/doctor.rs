@@ -302,11 +302,30 @@ pub fn run(node: &Node) -> Vec<Check> {
 			format!("{} healthy, serving {served}", node.llama_url),
 		));
 	} else {
-		out.push(Check::new(
-			"llama-server",
-			Status::Warn,
-			format!("{} not responding (no model served yet)", node.llama_url),
-		));
+		let (_, configured_port) = crate::nodeops::parse_bind(&node.llama_url);
+		if let Some(running_port) = llama::find_running_llama_port() {
+			if running_port != configured_port {
+				out.push(Check::new(
+					"llama-server",
+					Status::Warn,
+					format!(
+						"llama-server is running on port {running_port}, but fleet.toml has port {configured_port} (update llama_url)"
+					),
+				));
+			} else {
+				out.push(Check::new(
+					"llama-server",
+					Status::Warn,
+					format!("{} not responding (server down or starting)", node.llama_url),
+				));
+			}
+		} else {
+			out.push(Check::new(
+				"llama-server",
+				Status::Warn,
+				format!("{} not responding (no model served yet)", node.llama_url),
+			));
+		}
 	}
 
 	out

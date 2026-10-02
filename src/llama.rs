@@ -76,6 +76,16 @@ pub fn health_ok(url: &str) -> bool {
 	}
 }
 
+/// Find any running `llama-server` listening port via `ss -ltnp`.
+pub fn find_running_llama_port() -> Option<u16> {
+	let out = std::process::Command::new("ss").args(["-ltnp"]).output().ok()?;
+	let text = String::from_utf8_lossy(&out.stdout);
+	crate::netboot_server::parse_ss_listen(&text)
+		.into_iter()
+		.find(|o| o.comm == "llama-server")
+		.map(|o| o.port)
+}
+
 /// Pre-warm the KV cache with a few short completions after a swap, so the first
 /// real request isn't cold. Best-effort: failures are ignored.
 pub fn warm(url: &str, token_counts: &[u32]) {
