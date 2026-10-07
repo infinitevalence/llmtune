@@ -15,15 +15,12 @@ static IS_SYSTEMD: OnceLock<bool> = OnceLock::new();
 /// Detect the init system once, caching the result.
 pub fn is_systemd() -> bool {
 	*IS_SYSTEMD.get_or_init(|| {
-		if Path::new("/run/openrc").exists() || Path::new("/etc/init.d").is_dir() {
+		if Path::new("/sbin/openrc-run").exists() || Path::new("/run/openrc").exists() || Path::new("/etc/init.d").is_dir() {
 			if let Ok(content) = std::fs::read_to_string("/proc/1/comm") {
 				if content.trim() == "systemd" {
 					return true;
 				}
 			}
-			return false;
-		}
-		if Path::new("/sbin/openrc-run").exists() {
 			return false;
 		}
 		let systemctl = Command::new("systemctl")
@@ -36,16 +33,20 @@ pub fn is_systemd() -> bool {
 }
 
 pub fn debug_log(msg: &str) {
-	let log_path = crate::paths::shared_state_dir().join("llmtune.log");
-	if let Some(parent) = log_path.parent() {
-		let _ = std::fs::create_dir_all(parent);
-	}
-	if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-		let ts = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_secs())
-			.unwrap_or(0);
-		let _ = writeln!(f, "[{ts}] {msg}");
+	for path in [
+		PathBuf::from("/tmp/llmtune.log"),
+		crate::paths::shared_state_dir().join("llmtune.log"),
+	] {
+		if let Some(parent) = path.parent() {
+			let _ = std::fs::create_dir_all(parent);
+		}
+		if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+			let ts = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|d| d.as_secs())
+				.unwrap_or(0);
+			let _ = writeln!(f, "[{ts}] {msg}");
+		}
 	}
 }
 
