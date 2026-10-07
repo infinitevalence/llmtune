@@ -327,27 +327,10 @@ pub fn run(cfg: &Config, opts: &Opts) -> Result<()> {
 		} else {
 			println!("[skip] OpenRC init script not written");
 		}
-		if Path::new(&conf_path).exists() {
-			let content = std::fs::read_to_string(&conf_path).unwrap_or_default();
-			if content.contains("[Service]") || content.contains("ExecStart") {
-				let conf_body = openrc_conf_text(&user);
-				swap::sudo_tee(Path::new(&conf_path), &conf_body)
-					.with_context(|| format!("writing {conf_path}"))?;
-				println!("[ok]   overwrote stale OpenRC conf {conf_path}");
-			} else {
-				println!("[ok]   OpenRC conf file {conf_path} already present");
-			}
-		} else if confirm(
-			&format!("write OpenRC conf file {conf_path}?"),
-			opts.assume_yes,
-		) {
-			let conf_body = openrc_conf_text(&user);
-			swap::sudo_tee(Path::new(&conf_path), &conf_body)
-				.with_context(|| format!("writing {conf_path}"))?;
-			println!("[ok]   wrote {conf_path}");
-		} else {
-			println!("[skip] OpenRC conf file not written");
-		}
+		let conf_body = openrc_conf_text(&user);
+		swap::sudo_tee(Path::new(&conf_path), &conf_body)
+			.with_context(|| format!("writing {conf_path}"))?;
+		println!("[ok]   wrote OpenRC conf {conf_path}");
 	}
 
 	// 3. fleet.toml.
