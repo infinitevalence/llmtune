@@ -472,6 +472,8 @@ pub fn swap<A: Actuator, H: Health>(
 		&opts.base_env,
 		opts.fmt,
 	);
+	println!("[log] swap: staging model `{}` on unit `{}` (init: {})", model.name, unit, if matches!(opts.fmt, DropinFormat::Systemd) { "systemd" } else { "OpenRC" });
+	println!("[log] rendered drop-in/conf:\n{dropin}");
 	// Stage the new drop-in and restart. If EITHER step errors, the previous
 	// drop-in has already been removed/replaced, so roll back before returning -
 	// otherwise a systemctl failure strands the node with a bad (or no) config.
@@ -479,6 +481,22 @@ pub fn swap<A: Actuator, H: Health>(
 		.stage(unit, &dropin, opts.fmt)
 		.and_then(|()| act.reload_restart(unit))
 	{
+		println!("[log] swap error: {e:#}");
+		if !matches!(opts.fmt, DropinFormat::Systemd) {
+			let svc = unit.strip_suffix(".service").unwrap_or(unit);
+			let log_path = format!("/var/log/openrc/{svc}.log");
+			if std::path::Path::new(&log_path).exists() {
+				if let Ok(content) = std::fs::read_to_string(&log_path) {
+					let tail: Vec<&str> = content.lines().rev().take(30).collect();
+					if !tail.is_empty() {
+						println!("[log] tail of {log_path}:");
+						for l in tail.into_iter().rev() {
+							println!("  {l}");
+						}
+					}
+				}
+			}
+		}
 		// Report whether the revert actually succeeded - don't claim "reverted"
 		// if the rollback itself failed (the node may be stranded).
 		let reverted = act

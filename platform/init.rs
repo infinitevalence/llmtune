@@ -52,17 +52,35 @@ pub fn service_active(unit: &str) -> bool {
 
 /// Start or stop a service/unit.
 pub fn service_ctl(unit: &str, action: &str) {
-	if is_systemd() {
+	let is_sys = is_systemd();
+	let svc = unit.strip_suffix(".service").unwrap_or(unit);
+	println!("[log] service_ctl: unit={unit}, action={action}, init_system={}", if is_sys { "systemd" } else { "OpenRC" });
+	let res = if is_sys {
 		Command::new("systemctl")
 			.args([action, unit])
 			.status()
-			.ok();
 	} else {
-		let svc = unit.strip_suffix(".service").unwrap_or(unit);
 		Command::new("rc-service")
 			.args([svc, action])
 			.status()
-			.ok();
+	};
+	match res {
+		Ok(st) => println!("[log] service_ctl {action} on {svc}: exit status {st}"),
+		Err(e) => println!("[log] service_ctl {action} on {svc} failed to spawn: {e}"),
+	}
+	if !is_sys {
+		let log_path = format!("/var/log/openrc/{svc}.log");
+		if std::path::Path::new(&log_path).exists() {
+			if let Ok(content) = std::fs::read_to_string(&log_path) {
+				let tail: Vec<&str> = content.lines().rev().take(20).collect();
+				if !tail.is_empty() {
+					println!("[log] tail of {log_path}:");
+					for l in tail.into_iter().rev() {
+						println!("  {l}");
+					}
+				}
+			}
+		}
 	}
 }
 
