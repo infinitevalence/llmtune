@@ -882,39 +882,16 @@ fn dep_in_path(cmd: &str) -> bool {
 		.unwrap_or(false)
 }
 
-use crate::pkg::detect_pm;
-/// Build the install command for the Vulkan build toolchain.
-/// Each PM always uses the same packages — no distro map needed.
 fn install_cmd() -> String {
-	let pm = detect_pm();
-
-	match pm.as_deref() {
-		Some("pacman") => {
-			const PKGS: &str = "base-devel cmake git vulkan-headers vulkan-icd-loader spirv-headers shaderc";
-			format!("install: pacman -S --needed {PKGS}")
-		}
-		Some("apk") => {
-			const PKGS: &str = "gcc g++ cmake git vulkan-headers vulkan-loader-dev spirv-headers shaderc-dev";
-			format!("install: apk add {PKGS}")
-		}
-		Some("apt") => {
-			const PKGS: &str = "build-essential cmake git libvulkan-dev glslc spirv-headers";
-			format!("install: apt install {PKGS}")
-		}
-		Some("dnf") => {
-			const PKGS: &str = "gcc-c++ cmake git vulkan-headers vulkan-loader-devel glslc spirv-headers";
-			format!("install: dnf install {PKGS}")
-		}
-		Some("yum") => {
-			const PKGS: &str = "gcc-c++ cmake git vulkan-headers vulkan-loader-devel glslc spirv-headers";
-			format!("install: yum install {PKGS}")
-		}
-		_ => {
-			format!("install the Vulkan build toolchain for your distro: a C++ compiler, \
-				cmake, git, Vulkan headers + ICD loader, SPIR-V headers, and a \
-				shader compiler (glslc/shaderc)")
+	if let Some(pm) = crate::platform::pkg::detect_pm() {
+		let pkgs = crate::platform::pkg::toolchain_packages(&pm);
+		if !pkgs.is_empty() {
+			return crate::platform::pkg::install_cmd(&pkgs.join(" "));
 		}
 	}
+	format!("install the Vulkan build toolchain for your distro: a C++ compiler, \
+		cmake, git, Vulkan headers + ICD loader, SPIR-V headers, and a \
+		shader compiler (glslc/shaderc)")
 }
 
 /// True if any of `candidates` exists on disk (a header dir/file or a library

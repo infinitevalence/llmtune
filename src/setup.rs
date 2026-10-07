@@ -261,7 +261,7 @@ pub fn run(cfg: &Config, opts: &Opts) -> Result<()> {
 	println!("\n{}\n", crate::model::where_to_put_models(&models_dir));
 
 	// 2. Base systemd unit or OpenRC service.
-	if crate::init::is_systemd() {
+	if crate::platform::init::is_systemd() {
 		match existing_unit(&unit) {
 			Some(p) => println!("[ok]   unit {unit} already present ({})", p.display()),
 			None => {
@@ -358,11 +358,42 @@ pub fn run(cfg: &Config, opts: &Opts) -> Result<()> {
 		None => println!("[skip] no $HOME - cannot place fleet.toml"),
 	}
 
-	// 4. Engine.
+	// 4. Build Toolchain & Engine.
+	let dep = build::check_build_deps();
+	if !dep.missing.is_empty() {
+		println!("[warn] build toolchain incomplete: missing {}", dep.missing.join(", "));
+		if confirm(&format!("install missing build toolchain dependencies ({})?", dep.missing.join(", ")), opts.assume_yes) {
+			if let Some(pm) = crate::platform::pkg::detect_pm() {
+				let pkgs = crate::platform::pkg::toolchain_packages(&pm);
+				if !pkgs.is_empty() {
+					println!("[run]  installing build dependencies via {pm}...");
+					if let Err(e) = crate::platform::pkg::install_packages(pkgs) {
+						println!("[error] failed to install build packages: {e}");
+					} else {
+						println!("[ok]   installed build toolchain packages");
+					}
+				}
+			} else {
+				println!("[skip] no supported package manager detected - run manually: {}", dep.install_cmd);
+			}
+		}
+	}
+
 	if build::current_bin("vulkan", "llama-server").is_some() {
 		println!("[ok]   llama.cpp build `vulkan` installed");
+	} else if confirm("build and install llama.cpp vulkan engine now?", opts.assume_yes) {
+		match build::load().and_then(|specs| {
+			let spec = build::spec(&specs, "vulkan")
+				.cloned()
+				.ok_or_else(|| anyhow::anyhow!("no vulkan build recipe in builds.toml"))?;
+			let mut builder = build::RealBuilder::new();
+			build::install(&spec, &mut builder, build::DEFAULT_RETAIN)
+		}) {
+			Ok(out) => println!("[ok]   built and installed vulkan build ({})", out.slug),
+			Err(e) => println!("[error] build failed: {e} - run `llmtune build vulkan` when ready"),
+		}
 	} else {
-		println!("[next] build the engine:  llmtune build install vulkan");
+		println!("[next] build the engine:  llmtune build vulkan");
 	}
 
 	println!("\nsetup done. once a build + a model are present:  llmtune node load <name>");

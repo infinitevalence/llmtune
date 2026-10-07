@@ -227,6 +227,9 @@ pub(crate) enum BuildCmd {
 	},
 	/// Roll the current build back to the previously-installed version.
 	Rollback { name: String },
+	/// Direct build install shortcut (e.g. `llmtune build vulkan`).
+	#[command(external_subcommand)]
+	Direct(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -847,6 +850,13 @@ fn dispatch(cli: Cli) -> Result<()> {
 				retain,
 			} => cmd_build_install(&name, r#ref, retain, true, cli.json),
 			BuildCmd::Rollback { name } => cmd_build_rollback(&cfg, &name, cli.json),
+			BuildCmd::Direct(args) => {
+				if let Some(name) = args.first() {
+					cmd_build_install(name, None, build::DEFAULT_RETAIN, false, cli.json)
+				} else {
+					anyhow::bail!("pass a build name (e.g. `llmtune build vulkan`)");
+				}
+			}
 		},
 		Cmd::Mem {
 			model,

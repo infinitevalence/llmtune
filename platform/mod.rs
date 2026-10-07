@@ -19,10 +19,14 @@ mod nvidia;
 mod cpuonly;
 mod memory;
 
+// Package management & installation abstraction
+pub mod pkg;
+pub use pkg::{detect_pm, install_cmd, toolchain_packages, install_packages};
+
 // Init system detection + actuators
 pub mod init;
 pub mod systemd;
-mod openrc;
+pub mod openrc;
 pub use systemd::{SystemdActuator, user_unit_dir};
 pub use openrc::OpenrcActuator;
 
