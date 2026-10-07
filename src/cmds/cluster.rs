@@ -343,6 +343,7 @@ pub(crate) fn cmd_cluster_up(
 		// Carry the head's base-unit env (e.g. a declarative Vulkan stack)
 		// through the drop-in's Environment= reset.
 		base_env: swap::unit_base_env(&head.llama_unit, fmt),
+		fmt,
 		..Default::default()
 	};
 	let mut wctl = cluster::RealWorkerCtl::new();

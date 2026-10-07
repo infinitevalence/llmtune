@@ -164,6 +164,7 @@ pub fn load(node: &Node, query: &str) -> Result<(swap::SwapOutcome, bool, bool)>
 		// Carry the base unit's own env (the netboot image's declarative
 		// gfx1013 Vulkan stack) through the drop-in's Environment= reset.
 		base_env: swap::unit_base_env(&node.llama_unit, fmt),
+		fmt,
 		..Default::default()
 	};
 	let mut act = if matches!(fmt, swap::DropinFormat::Systemd) {
