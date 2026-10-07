@@ -1881,11 +1881,7 @@ impl NodeApp {
 			return;
 		}
 		let unit = self.node.llama_unit.clone();
-		let active = std::process::Command::new("systemctl")
-			.args(["is-active", "--quiet", &unit])
-			.status()
-			.map(|s| s.success())
-			.unwrap_or(false);
+		let active = crate::init::service_active(&unit);
 		let action = if active { "stop" } else { "start" };
 		crate::init::service_ctl(&unit, action);
 		self.status = if active {

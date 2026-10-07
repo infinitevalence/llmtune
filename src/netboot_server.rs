@@ -1381,7 +1381,8 @@ pub fn down(cfg: &Config, json: bool) -> Result<()> {
 				let argv = if crate::init::is_systemd() {
 					vec!["systemctl", "stop", svc].into_boxed_slice()
 				} else {
-					vec!["rc-service", "stop", svc].into_boxed_slice()
+					let s = svc.strip_suffix(".service").unwrap_or(svc);
+					vec!["rc-service", s, "stop"].into_boxed_slice()
 				};
 				match crate::swap::sudo(&argv[..]) {
 					Ok(()) => undone.push(format!("stopped {svc}")),

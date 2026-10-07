@@ -619,7 +619,8 @@ pub fn clear_dropin(unit: &str, fmt: DropinFormat) -> Result<()> {
 			sudo(&["systemctl", "restart", unit])?;
 		}
 		DropinFormat::OpenRC => {
-			sudo(&["rc-service", unit, "restart"])?;
+			let svc = unit.strip_suffix(".service").unwrap_or(unit);
+			sudo(&["rc-service", svc, "restart"])?;
 		}
 	}
 	Ok(())

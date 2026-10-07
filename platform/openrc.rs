@@ -58,7 +58,8 @@ impl Actuator for OpenrcActuator {
     }
 
     fn restart(&mut self, unit: &str) -> Result<()> {
-        sudo(&["rc-service", unit, "restart"])?;
+        let svc = unit.strip_suffix(".service").unwrap_or(unit);
+        sudo(&["rc-service", svc, "restart"])?;
         Ok(())
     }
 }

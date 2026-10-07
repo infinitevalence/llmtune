@@ -193,11 +193,7 @@ pub(crate) fn cmd_node_server(
 			}
 		}
 		ServerAction::Stop => {
-			if crate::init::is_systemd() {
-				swap::sudo(&["systemctl", "stop", &unit])?;
-			} else {
-				swap::sudo(&["rc-service", "stop", &unit])?;
-			}
+			crate::init::service_ctl(&unit, "stop");
 			if json {
 				println!("{}", serde_json::json!({"unit": unit, "result": "stopped"}));
 			} else {
@@ -205,11 +201,7 @@ pub(crate) fn cmd_node_server(
 			}
 		}
 		ServerAction::Start => {
-			if crate::init::is_systemd() {
-				swap::sudo(&["systemctl", "start", &unit])?;
-			} else {
-				swap::sudo(&["rc-service", "start", &unit])?;
-			}
+			crate::init::service_ctl(&unit, "start");
 			if json {
 				println!("{}", serde_json::json!({"unit": unit, "result": "started"}));
 			} else {
@@ -217,11 +209,7 @@ pub(crate) fn cmd_node_server(
 			}
 		}
 		ServerAction::Restart => {
-			if crate::init::is_systemd() {
-				swap::sudo(&["systemctl", "restart", &unit])?;
-			} else {
-				swap::sudo(&["rc-service", "restart", &unit])?;
-			}
+			crate::init::service_ctl(&unit, "restart");
 			if json {
 				println!(
 					"{}",

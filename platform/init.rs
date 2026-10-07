@@ -41,8 +41,9 @@ pub fn service_active(unit: &str) -> bool {
 			.map(|s| s.success())
 			.unwrap_or(false)
 	} else {
+		let svc = unit.strip_suffix(".service").unwrap_or(unit);
 		Command::new("rc-status")
-			.args(["-q", "--query", unit])
+			.args(["-q", "--query", svc])
 			.status()
 			.map(|s| s.success())
 			.unwrap_or(false)
@@ -57,8 +58,9 @@ pub fn service_ctl(unit: &str, action: &str) {
 			.status()
 			.ok();
 	} else {
+		let svc = unit.strip_suffix(".service").unwrap_or(unit);
 		Command::new("rc-service")
-			.args([action, unit])
+			.args([svc, action])
 			.status()
 			.ok();
 	}
