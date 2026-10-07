@@ -42,8 +42,8 @@ pub fn service_active(unit: &str) -> bool {
 			.unwrap_or(false)
 	} else {
 		let svc = unit.strip_suffix(".service").unwrap_or(unit);
-		Command::new("rc-status")
-			.args(["-q", "--query", svc])
+		Command::new("rc-service")
+			.args([svc, "status"])
 			.status()
 			.map(|s| s.success())
 			.unwrap_or(false)
