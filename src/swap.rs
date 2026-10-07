@@ -197,7 +197,7 @@ pub fn render_dropin(
 			flags
 		),
 		DropinFormat::OpenRC => format!(
-			"command_args=\"-m \"{}\" --host {} --port {} {}\"\n",
+			"command_args='-m \"{}\" --host {} --port {} {}'\n",
 			model_path.display(),
 			host,
 			port,

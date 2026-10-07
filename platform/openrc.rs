@@ -7,7 +7,7 @@ use crate::platform::{Actuator, DropinFormat};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::process::Command;
-use crate::swap::{is_root, root_cmd, sudo, sudo_tee_secret};
+use crate::swap::{is_root, root_cmd, sudo, sudo_tee};
 
 pub struct OpenrcActuator {
     wrote: Option<String>,
@@ -43,14 +43,14 @@ impl Actuator for OpenrcActuator {
                 .and_then(|o| String::from_utf8(o.stdout).ok())
         };
         self.wrote = Some(dropin_content.to_string());
-        sudo_tee_secret(&conf, dropin_content)
+        sudo_tee(&conf, dropin_content)
     }
 
     fn rollback(&mut self, unit: &str) -> Result<()> {
         if let Some(prev) = self.prev.take() {
             let svc = unit.strip_suffix(".service").unwrap_or(unit);
             let p = PathBuf::from(format!("/etc/conf.d/{svc}"));
-            sudo_tee_secret(&p, &prev)?;
+            sudo_tee(&p, &prev)?;
         }
         Ok(())
     }
