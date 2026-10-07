@@ -15,12 +15,16 @@ static IS_SYSTEMD: OnceLock<bool> = OnceLock::new();
 /// Detect the init system once, caching the result.
 pub fn is_systemd() -> bool {
 	*IS_SYSTEMD.get_or_init(|| {
-		if Path::new("/sbin/openrc-run").exists() || Path::new("/run/openrc").exists() || Path::new("/etc/init.d").is_dir() {
+		let openrc = Path::new("/sbin/openrc-run").exists() || Path::new("/run/openrc").exists() || Path::new("/etc/init.d").is_dir();
+		debug_log(&format!("is_systemd check: openrc_present={openrc}"));
+		if openrc {
 			if let Ok(content) = std::fs::read_to_string("/proc/1/comm") {
 				if content.trim() == "systemd" {
+					debug_log("is_systemd: PID 1 is systemd -> true");
 					return true;
 				}
 			}
+			debug_log("is_systemd: OpenRC present, PID 1 not systemd -> false");
 			return false;
 		}
 		let systemctl = Command::new("systemctl")
@@ -28,6 +32,7 @@ pub fn is_systemd() -> bool {
 			.output()
 			.map(|o| o.status.success())
 			.unwrap_or(false);
+		debug_log(&format!("is_systemd: systemctl exists/succeeded={systemctl}"));
 		systemctl
 	})
 }
