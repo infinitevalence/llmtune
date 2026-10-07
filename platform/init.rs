@@ -23,6 +23,9 @@ pub fn is_systemd() -> bool {
 			}
 			return false;
 		}
+		if Path::new("/sbin/openrc-run").exists() {
+			return false;
+		}
 		let systemctl = Command::new("systemctl")
 			.arg("--version")
 			.output()
@@ -30,6 +33,20 @@ pub fn is_systemd() -> bool {
 			.unwrap_or(false);
 		systemctl
 	})
+}
+
+pub fn debug_log(msg: &str) {
+	let log_path = crate::paths::shared_state_dir().join("llmtune.log");
+	if let Some(parent) = log_path.parent() {
+		let _ = std::fs::create_dir_all(parent);
+	}
+	if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+		let ts = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		let _ = writeln!(f, "[{ts}] {msg}");
+	}
 }
 
 /// Check whether a service/unit is active.
@@ -54,7 +71,7 @@ pub fn service_active(unit: &str) -> bool {
 pub fn service_ctl(unit: &str, action: &str) {
 	let is_sys = is_systemd();
 	let svc = unit.strip_suffix(".service").unwrap_or(unit);
-	println!("[log] service_ctl: unit={unit}, action={action}, init_system={}", if is_sys { "systemd" } else { "OpenRC" });
+	debug_log(&format!("service_ctl: unit={unit}, action={action}, init_system={}", if is_sys { "systemd" } else { "OpenRC" }));
 	let res = if is_sys {
 		Command::new("systemctl")
 			.args([action, unit])
@@ -65,8 +82,8 @@ pub fn service_ctl(unit: &str, action: &str) {
 			.status()
 	};
 	match res {
-		Ok(st) => println!("[log] service_ctl {action} on {svc}: exit status {st}"),
-		Err(e) => println!("[log] service_ctl {action} on {svc} failed to spawn: {e}"),
+		Ok(st) => debug_log(&format!("service_ctl {action} on {svc}: exit status {st}")),
+		Err(e) => debug_log(&format!("service_ctl {action} on {svc} failed to spawn: {e}")),
 	}
 	if !is_sys {
 		let log_path = format!("/var/log/openrc/{svc}.log");
@@ -74,9 +91,9 @@ pub fn service_ctl(unit: &str, action: &str) {
 			if let Ok(content) = std::fs::read_to_string(&log_path) {
 				let tail: Vec<&str> = content.lines().rev().take(20).collect();
 				if !tail.is_empty() {
-					println!("[log] tail of {log_path}:");
+					debug_log(&format!("tail of {log_path}:"));
 					for l in tail.into_iter().rev() {
-						println!("  {l}");
+						debug_log(&format!("  {l}"));
 					}
 				}
 			}

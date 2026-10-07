@@ -472,8 +472,8 @@ pub fn swap<A: Actuator, H: Health>(
 		&opts.base_env,
 		opts.fmt,
 	);
-	println!("[log] swap: staging model `{}` on unit `{}` (init: {})", model.name, unit, if matches!(opts.fmt, DropinFormat::Systemd) { "systemd" } else { "OpenRC" });
-	println!("[log] rendered drop-in/conf:\n{dropin}");
+	crate::platform::init::debug_log(&format!("swap: staging model `{}` on unit `{}` (init: {})", model.name, unit, if matches!(opts.fmt, DropinFormat::Systemd) { "systemd" } else { "OpenRC" }));
+	crate::platform::init::debug_log(&format!("rendered drop-in/conf:\n{dropin}"));
 	// Stage the new drop-in and restart. If EITHER step errors, the previous
 	// drop-in has already been removed/replaced, so roll back before returning -
 	// otherwise a systemctl failure strands the node with a bad (or no) config.
@@ -481,7 +481,7 @@ pub fn swap<A: Actuator, H: Health>(
 		.stage(unit, &dropin, opts.fmt)
 		.and_then(|()| act.reload_restart(unit))
 	{
-		println!("[log] swap error: {e:#}");
+		crate::platform::init::debug_log(&format!("swap error: {e:#}"));
 		if !matches!(opts.fmt, DropinFormat::Systemd) {
 			let svc = unit.strip_suffix(".service").unwrap_or(unit);
 			let log_path = format!("/var/log/openrc/{svc}.log");
@@ -489,9 +489,9 @@ pub fn swap<A: Actuator, H: Health>(
 				if let Ok(content) = std::fs::read_to_string(&log_path) {
 					let tail: Vec<&str> = content.lines().rev().take(30).collect();
 					if !tail.is_empty() {
-						println!("[log] tail of {log_path}:");
+						crate::platform::init::debug_log(&format!("tail of {log_path}:"));
 						for l in tail.into_iter().rev() {
-							println!("  {l}");
+							crate::platform::init::debug_log(&format!("  {l}"));
 						}
 					}
 				}
