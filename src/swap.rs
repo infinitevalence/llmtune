@@ -197,8 +197,7 @@ pub fn render_dropin(
 			flags
 		),
 		DropinFormat::OpenRC => format!(
-			"command_args=\"stdbuf -oL -eL \"{}\" -m \"{}\" --host {} --port {} {}\"\n",
-			bin,
+			"command_args=\"-m \"{}\" --host {} --port {} {}\"\n",
 			model_path.display(),
 			host,
 			port,
@@ -281,8 +280,8 @@ pub fn unit_base_env(unit: &str, fmt: DropinFormat) -> BTreeMap<String, String> 
 				.unwrap_or_default()
 		}
 		DropinFormat::OpenRC => {
-			// /etc/conf.d/{unit} uses export K=V or bare K=V
-			let path = format!("/etc/conf.d/{}", unit);
+			let svc = unit.strip_suffix(".service").unwrap_or(unit);
+			let path = format!("/etc/conf.d/{}", svc);
 			std::fs::read_to_string(&path)
 				.map(|t| parse_openrc_env(&t))
 				.unwrap_or_default()
@@ -767,13 +766,14 @@ fn collect_dropins_llmtune(unit: &str, fmt: DropinFormat) -> (Vec<PathBuf>, Vec<
 /// OpenRC uses a single conf file instead of systemd's drop-in directory, so
 /// this scans the directory for any file carrying our marker.
 fn collect_openrc_dropins(unit: &str) -> (Vec<PathBuf>, Vec<String>) {
-	let conf_dir = PathBuf::from(format!("/etc/conf.d/{unit}"));
+	let svc = unit.strip_suffix(".service").unwrap_or(unit);
+	let conf_file = PathBuf::from(format!("/etc/conf.d/{svc}"));
 	let mut ours = Vec::new();
 	let mut foreign = Vec::new();
-	// OpenRC conf.d/<unit> is a single file, but we also scan the parent
+	// OpenRC conf.d/<svc> is a single file, but we also scan the parent
 	// directory for any other llmtune-marked conf files (e.g. safe-fallback
 	// or crash-loop guards that may have been placed there by older llmtune).
-	if let Some(rd) = conf_dir.parent().and_then(|p| std::fs::read_dir(p).ok()) {
+	if let Some(rd) = conf_file.parent().and_then(|p| std::fs::read_dir(p).ok()) {
 		for e in rd.flatten() {
 			let p = e.path();
 			if p.extension().and_then(|x| x.to_str()) != Some("conf") {

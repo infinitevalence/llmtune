@@ -312,7 +312,7 @@ pub fn run(cfg: &Config, opts: &Opts) -> Result<()> {
 	} else {
 		let service_name = unit.strip_suffix(".service").unwrap_or(&unit);
 		let init_path = format!("/etc/init.d/{service_name}");
-		let conf_path = format!("/etc/conf.d/{unit}");
+		let conf_path = format!("/etc/conf.d/{service_name}");
 		if Path::new(&init_path).exists() {
 			println!("[ok]   OpenRC init script {init_path} already present");
 		} else if confirm(

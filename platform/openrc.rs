@@ -31,7 +31,8 @@ impl Default for OpenrcActuator {
 
 impl Actuator for OpenrcActuator {
     fn stage(&mut self, unit: &str, dropin_content: &str, _fmt: DropinFormat) -> Result<()> {
-        let conf = PathBuf::from(format!("/etc/conf.d/{unit}"));
+        let svc = unit.strip_suffix(".service").unwrap_or(unit);
+        let conf = PathBuf::from(format!("/etc/conf.d/{svc}"));
         self.prev = if is_root() {
             std::fs::read_to_string(&conf).ok()
         } else {
@@ -47,7 +48,8 @@ impl Actuator for OpenrcActuator {
 
     fn rollback(&mut self, unit: &str) -> Result<()> {
         if let Some(prev) = self.prev.take() {
-            let p = PathBuf::from(format!("/etc/conf.d/{unit}"));
+            let svc = unit.strip_suffix(".service").unwrap_or(unit);
+            let p = PathBuf::from(format!("/etc/conf.d/{svc}"));
             sudo_tee_secret(&p, &prev)?;
         }
         Ok(())

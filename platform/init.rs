@@ -241,7 +241,8 @@ fn unit_user_systemd(unit: &str) -> String {
 }
 
 fn openrc_unit_user(unit: &str) -> String {
-	let conf = PathBuf::from(format!("/etc/conf.d/{unit}"));
+	let svc = unit.strip_suffix(".service").unwrap_or(unit);
+	let conf = PathBuf::from(format!("/etc/conf.d/{svc}"));
 	let content = if is_root() {
 		std::fs::read_to_string(&conf).unwrap_or_default()
 	} else {
