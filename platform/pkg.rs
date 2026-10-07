@@ -23,7 +23,15 @@ pub fn detect_pm() -> Option<String> {
 }
 
 pub fn install_cmd(pkg: &str) -> String {
-	detect_pm().map(|pm| format!("install: {} {}", pm, pkg)).unwrap_or_else(|| {
+	detect_pm().map(|pm| {
+		match pm.as_str() {
+			"apk" => format!("install: apk add {pkg}"),
+			"pacman" => format!("install: pacman -S --needed {pkg}"),
+			"apt" => format!("install: apt install {pkg}"),
+			"dnf" | "yum" => format!("install: {pm} install {pkg}"),
+			_ => format!("install: {pm} {pkg}"),
+		}
+	}).unwrap_or_else(|| {
 		format!("install {pkg} for your distro")
 	})
 }
@@ -40,16 +48,13 @@ pub fn toolchain_packages(pm: &str) -> &'static [&'static str] {
 
 pub fn install_packages(pkgs: &[&str]) -> Result<()> {
 	let pm = detect_pm().ok_or_else(|| anyhow::anyhow!("no supported package manager found (pacman, apk, apt, dnf, yum)"))?;
-	let args: Vec<String> = match pm.as_str() {
+	let args = match pm.as_str() {
 		"pacman" => {
 			let mut a = vec![pm.clone(), "-S".into(), "--noconfirm".into(), "--needed".into()];
 			a.extend(pkgs.iter().map(|s| s.to_string()));
 			a
 		}
 		"apk" => {
-			let mut a = vec![pm.clone(), "update".into()];
-			// apk add needs update first or direct add; let's do update then add or combined via sh if needed, or run update and add separately.
-			// Actually, running update first:
 			let _ = sudo(&[pm.as_str(), "update"]);
 			let mut a = vec![pm.clone(), "add".into()];
 			a.extend(pkgs.iter().map(|s| s.to_string()));

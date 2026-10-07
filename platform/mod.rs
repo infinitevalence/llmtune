@@ -21,6 +21,7 @@ mod memory;
 
 // Package management & installation abstraction
 pub mod pkg;
+#[allow(unused_imports)]
 pub use pkg::{detect_pm, install_cmd, toolchain_packages, install_packages};
 
 // Init system detection + actuators

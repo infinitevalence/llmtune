@@ -448,6 +448,7 @@ fn log_line(msg: &str) {
 /// pinning a worker forever. The inheritance is pinned by a unit test.
 fn set_socket_timeouts(l: &std::net::TcpListener, t: Duration) -> Result<()> {
 	use std::os::fd::AsRawFd;
+	#[allow(deprecated)]
 	let tv = libc::timeval {
 		tv_sec: t.as_secs() as libc::time_t,
 		tv_usec: t.subsec_micros() as libc::suseconds_t,
